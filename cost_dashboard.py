@@ -336,8 +336,10 @@ def get_project_path_from_jsonl(project_dir, source_type: str = "standard"):
                         continue
                     data = json.loads(line)
                     if source_type == "claude":
-                        # Skip file-history-snapshot, look for cwd
+                        # Skip records that don't carry cwd
                         if data.get("type") in (
+                            "queue-operation",
+                            "progress",
                             "file-history-snapshot",
                             "summary",
                         ):
