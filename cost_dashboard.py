@@ -131,10 +131,13 @@ def create_daily_stats() -> DailyStats:
     return {"messages": 0, "tokens": 0, "cost": 0.0}
 
 
-# Session directories for different agents: (path, agent_command)
+# Session directories for different agents: (path, agent_command, source_type)
+# source_type: "standard" (pi/omp), "claude" (~/.claude/projects), "codex" (~/.codex/sessions)
 SESSIONS_DIRS = [
-    (Path.home() / ".pi" / "agent" / "sessions", "pi"),
-    (Path.home() / ".omp" / "agent" / "sessions", "omp"),
+    (Path.home() / ".pi" / "agent" / "sessions", "pi", "standard"),
+    (Path.home() / ".omp" / "agent" / "sessions", "omp", "standard"),
+    (Path.home() / ".claude" / "projects", "claude", "claude"),
+    (Path.home() / ".codex" / "sessions", "codex", "codex"),
 ]
 TEMP_DIR = Path(tempfile.gettempdir()) / "pi-dashboard"
 
@@ -148,21 +151,29 @@ def clear_session_registry() -> None:
     SESSION_REGISTRY.clear()
 
 
-def get_session_id_from_file(filepath: str) -> str | None:
-    """Extract session ID from the first line of a JSONL file.
+def get_session_id_from_file(
+    filepath: str, source_type: str = "standard"
+) -> str | None:
+    """Extract session ID from a JSONL file.
 
-    The first line should be a session record like:
-    {"type":"session","id":"5d741a94-5587-4176-b557-1614ca95ac8c",...}
-
-    Returns the session ID if found, None otherwise.
+    For standard (pi/omp): first line {"type":"session","id":"..."}
+    For claude: use the filename stem (UUID)
+    For codex: read session_meta.payload.id
     """
+    if source_type == "claude":
+        return Path(filepath).stem
+
     try:
         with open(filepath, "r") as f:
             first_line = f.readline().strip()
             if first_line:
                 data = json.loads(first_line)
-                if data.get("type") == "session" and "id" in data:
-                    return data["id"]
+                if source_type == "codex":
+                    if data.get("type") == "session_meta":
+                        return data.get("payload", {}).get("id")
+                else:
+                    if data.get("type") == "session" and "id" in data:
+                        return data["id"]
     except (OSError, json.JSONDecodeError, KeyError, TypeError):
         pass
     return None
@@ -194,19 +205,81 @@ MANUAL_PRICING = {
         "output": 10.00,
         "cache_read": 0.31,
     },
+    # Claude models (per 1M tokens) - from Anthropic API pricing
+    "claude-opus-4": {
+        "input": 5.0,
+        "output": 25.0,
+        "cache_read": 0.5,
+        "cache_write": 6.25,
+    },
+    "claude-sonnet-4": {
+        "input": 3.0,
+        "output": 15.0,
+        "cache_read": 0.3,
+        "cache_write": 3.75,
+    },
+    "claude-haiku-4": {
+        "input": 1.0,
+        "output": 5.0,
+        "cache_read": 0.1,
+        "cache_write": 1.25,
+    },
+    # GLM models
+    "glm-4.7": {
+        "input": 0.4,
+        "output": 1.0,
+        "cache_read": 0.0,
+        "cache_write": 0.0,
+    },
+    "glm-4.5-air": {
+        "input": 0.2,
+        "output": 1.1,
+        "cache_read": 0.03,
+        "cache_write": 0.0,
+    },
+    # OpenAI/Codex models (estimated pricing)
+    "gpt-5": {
+        "input": 2.0,
+        "output": 8.0,
+        "cache_read": 0.5,
+    },
+    "gpt-4": {
+        "input": 2.5,
+        "output": 10.0,
+        "cache_read": 1.25,
+    },
+    "o3": {
+        "input": 2.0,
+        "output": 8.0,
+        "cache_read": 0.5,
+    },
+    "o4-mini": {
+        "input": 1.1,
+        "output": 4.4,
+        "cache_read": 0.275,
+    },
 }
 
 
 def get_manual_cost(
-    model: str, input_tokens: int, output_tokens: int, cache_read_tokens: int
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int,
+    cache_write_tokens: int = 0,
 ) -> float:
     """Calculate cost using manual pricing if available."""
     for pattern, pricing in MANUAL_PRICING.items():
         if pattern in model.lower():
             input_cost = (input_tokens / 1_000_000) * pricing["input"]
             output_cost = (output_tokens / 1_000_000) * pricing["output"]
-            cache_cost = (cache_read_tokens / 1_000_000) * pricing.get("cache_read", 0)
-            return input_cost + output_cost + cache_cost
+            cache_read_cost = (cache_read_tokens / 1_000_000) * pricing.get(
+                "cache_read", 0
+            )
+            cache_write_cost = (cache_write_tokens / 1_000_000) * pricing.get(
+                "cache_write", 0
+            )
+            return input_cost + output_cost + cache_read_cost + cache_write_cost
     return 0.0
 
 
@@ -251,17 +324,35 @@ def calc_avg_tokens_per_sec(tps_samples):
     return sum(tps_values) / len(tps_values)
 
 
-def get_project_path_from_jsonl(project_dir):
+def get_project_path_from_jsonl(project_dir, source_type: str = "standard"):
     """Get the actual project path from the first session file's cwd field."""
     jsonl_files = sorted(project_dir.glob("*.jsonl"))
     for filepath in jsonl_files:
         try:
             with open(filepath, "r") as f:
-                first_line = f.readline().strip()
-                if first_line:
-                    data = json.loads(first_line)
-                    if data.get("type") == "session" and "cwd" in data:
-                        return data["cwd"]
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    data = json.loads(line)
+                    if source_type == "claude":
+                        # Skip file-history-snapshot, look for cwd
+                        if data.get("type") in (
+                            "file-history-snapshot",
+                            "summary",
+                        ):
+                            continue
+                        if data.get("cwd"):
+                            return data["cwd"]
+                    elif source_type == "codex":
+                        if data.get("type") == "session_meta":
+                            cwd = data.get("payload", {}).get("cwd")
+                            if cwd:
+                                return cwd
+                    else:
+                        if data.get("type") == "session" and "cwd" in data:
+                            return data["cwd"]
+                    break  # Only check first relevant line
         except (OSError, json.JSONDecodeError, KeyError, TypeError):
             continue
     return project_dir.name
@@ -424,10 +515,341 @@ def analyze_jsonl_file(filepath: Path) -> SessionStats:
     return stats
 
 
-def analyze_project(project_dir: Path, agent_cmd: str) -> ProjectStats | None:
+def analyze_claude_jsonl_file(filepath: Path) -> SessionStats:
+    """Analyze a Claude Code JSONL session file and return stats.
+
+    Claude Code format: each line is a JSON record with top-level 'type' field.
+    Types include: user, assistant, progress, file-history-snapshot, summary.
+    Usage is in message.usage with input_tokens, output_tokens, cache_read_input_tokens,
+    cache_creation_input_tokens. No embedded cost - compute via get_manual_cost().
+    """
+    stats: SessionStats = {
+        "messages": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "total_tokens": 0,
+        "cost_total": 0.0,
+        "models": defaultdict(create_model_stats),
+        "timestamps": [],
+        "start": None,
+        "end": None,
+        "llm_time": 0.0,
+        "tool_time": 0.0,
+        "tools": defaultdict(create_tool_stats),
+        "tps_samples": [],
+        "cwd": "",
+    }
+
+    last_request_ts = None
+    pending_tool_calls = {}  # tool_use id -> {"name": str, "timestamp": datetime}
+    cwd = ""
+
+    try:
+        with open(filepath, "r") as f:
+            for line in f:
+                try:
+                    data = json.loads(line.strip())
+                except json.JSONDecodeError:
+                    continue
+
+                record_type = data.get("type")
+
+                # Skip progress records (subagent data - avoid double-counting)
+                # Skip file-history-snapshot and summary records
+                if record_type in ("progress", "file-history-snapshot", "summary"):
+                    continue
+
+                # Extract cwd from first record that has it
+                if not cwd and data.get("cwd"):
+                    cwd = data["cwd"]
+
+                ts = parse_timestamp(data.get("timestamp"))
+
+                if record_type == "user":
+                    if ts:
+                        last_request_ts = ts
+                    # Check for tool_result in user message content
+                    msg = data.get("message", {})
+                    content = msg.get("content", [])
+                    if isinstance(content, list):
+                        for item in content:
+                            if not isinstance(item, dict):
+                                continue
+                            if item.get("type") == "tool_result":
+                                tool_use_id = item.get("tool_use_id")
+                                is_error = item.get("is_error", False)
+                                if (
+                                    ts
+                                    and tool_use_id
+                                    and tool_use_id in pending_tool_calls
+                                ):
+                                    call_info = pending_tool_calls.pop(tool_use_id)
+                                    tool_delta = (
+                                        ts - call_info["timestamp"]
+                                    ).total_seconds()
+                                    if 0 < tool_delta < 600:
+                                        stats["tool_time"] += tool_delta
+                                        tool_name = call_info["name"]
+                                        stats["tools"][tool_name]["calls"] += 1
+                                        stats["tools"][tool_name][
+                                            "time"
+                                        ] += tool_delta
+                                        if is_error:
+                                            stats["tools"][tool_name]["errors"] += 1
+
+                elif record_type == "assistant":
+                    msg = data.get("message", {})
+                    usage = msg.get("usage", {})
+                    model = msg.get("model", "")
+
+                    # Skip synthetic records
+                    if model == "<synthetic>":
+                        continue
+
+                    # Calculate LLM time
+                    llm_delta = 0
+                    if ts and last_request_ts:
+                        llm_delta = (ts - last_request_ts).total_seconds()
+                        if 0 < llm_delta < 300:
+                            stats["llm_time"] += llm_delta
+                        else:
+                            llm_delta = 0
+                        last_request_ts = None
+
+                    # Process usage data if present
+                    if usage and model:
+                        input_tok = usage.get("input_tokens", 0)
+                        output_tok = usage.get("output_tokens", 0)
+                        cache_read_tok = usage.get("cache_read_input_tokens", 0)
+                        cache_write_tok = usage.get(
+                            "cache_creation_input_tokens", 0
+                        )
+                        total_tok = input_tok + output_tok + cache_read_tok + cache_write_tok
+
+                        cost = get_manual_cost(
+                            model,
+                            input_tok,
+                            output_tok,
+                            cache_read_tok,
+                            cache_write_tok,
+                        )
+
+                        stats["messages"] += 1
+                        stats["input_tokens"] += input_tok
+                        stats["output_tokens"] += output_tok
+                        stats["cache_read_tokens"] += cache_read_tok
+                        stats["cache_write_tokens"] += cache_write_tok
+                        stats["total_tokens"] += total_tok
+                        stats["cost_total"] += cost
+
+                        stats["models"][model]["messages"] += 1
+                        stats["models"][model]["tokens"] += total_tok
+                        stats["models"][model]["cost"] += cost
+                        stats["models"][model]["output_tokens"] += output_tok
+
+                        if llm_delta > 0 and output_tok > 0:
+                            stats["tps_samples"].append(
+                                (output_tok, llm_delta, model)
+                            )
+                            stats["models"][model]["llm_time"] += llm_delta
+
+                        if ts:
+                            stats["timestamps"].append(ts)
+                            if stats["start"] is None or ts < stats["start"]:
+                                stats["start"] = ts
+                            if stats["end"] is None or ts > stats["end"]:
+                                stats["end"] = ts
+
+                    # Track tool_use calls from assistant content
+                    content = msg.get("content", [])
+                    if isinstance(content, list):
+                        for item in content:
+                            if (
+                                isinstance(item, dict)
+                                and item.get("type") == "tool_use"
+                            ):
+                                tool_id = item.get("id")
+                                tool_name = item.get("name", "unknown")
+                                if tool_id and ts:
+                                    pending_tool_calls[tool_id] = {
+                                        "name": tool_name,
+                                        "timestamp": ts,
+                                    }
+
+    except Exception as e:
+        print(f"Error reading Claude session {filepath}: {e}")
+
+    stats["cwd"] = cwd
+    return stats
+
+
+def analyze_codex_jsonl_file(filepath: Path) -> SessionStats:
+    """Analyze a Codex CLI JSONL session file and return stats.
+
+    Codex format uses record types: session_meta, turn_context, event_msg, response_item.
+    Usage is in event_msg records where payload.type == "token_count" with
+    payload.info.last_token_usage fields. Tool calls are response_item with
+    payload.type == "function_call"/"function_call_output".
+    """
+    stats: SessionStats = {
+        "messages": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "total_tokens": 0,
+        "cost_total": 0.0,
+        "models": defaultdict(create_model_stats),
+        "timestamps": [],
+        "start": None,
+        "end": None,
+        "llm_time": 0.0,
+        "tool_time": 0.0,
+        "tools": defaultdict(create_tool_stats),
+        "tps_samples": [],
+        "cwd": "",
+    }
+
+    cwd = ""
+    model = ""
+    pending_tool_calls = {}  # call_id -> {"name": str, "timestamp": datetime}
+    last_total_usage = None  # For deduplication of token_count events
+
+    try:
+        with open(filepath, "r") as f:
+            for line in f:
+                try:
+                    data = json.loads(line.strip())
+                except json.JSONDecodeError:
+                    continue
+
+                record_type = data.get("type")
+                payload = data.get("payload", {})
+                ts = parse_timestamp(data.get("timestamp"))
+
+                if record_type == "session_meta":
+                    if not cwd:
+                        cwd = payload.get("cwd", "")
+                    if ts:
+                        if stats["start"] is None or ts < stats["start"]:
+                            stats["start"] = ts
+
+                elif record_type == "turn_context":
+                    # Get the model from turn_context
+                    if payload.get("model"):
+                        model = payload["model"]
+
+                elif record_type == "event_msg":
+                    if payload.get("type") == "token_count":
+                        info = payload.get("info")
+                        if not info:
+                            continue
+                        last_usage = info.get("last_token_usage", {})
+                        total_usage = info.get("total_token_usage", {})
+
+                        # Deduplicate: skip if total_usage matches previous
+                        total_key = (
+                            total_usage.get("input_tokens", 0),
+                            total_usage.get("output_tokens", 0),
+                            total_usage.get("total_tokens", 0),
+                        )
+                        if total_key == last_total_usage:
+                            continue
+                        last_total_usage = total_key
+
+                        input_tok = last_usage.get("input_tokens", 0)
+                        output_tok = last_usage.get("output_tokens", 0)
+                        cache_read_tok = last_usage.get("cached_input_tokens", 0)
+                        reasoning_tok = last_usage.get(
+                            "reasoning_output_tokens", 0
+                        )
+                        total_tok = last_usage.get(
+                            "total_tokens",
+                            input_tok + output_tok + cache_read_tok,
+                        )
+
+                        if total_tok == 0:
+                            continue
+
+                        cost = get_manual_cost(
+                            model, input_tok, output_tok, cache_read_tok
+                        )
+
+                        stats["messages"] += 1
+                        stats["input_tokens"] += input_tok
+                        stats["output_tokens"] += output_tok + reasoning_tok
+                        stats["cache_read_tokens"] += cache_read_tok
+                        stats["total_tokens"] += total_tok
+                        stats["cost_total"] += cost
+
+                        current_model = model or "unknown"
+                        stats["models"][current_model]["messages"] += 1
+                        stats["models"][current_model]["tokens"] += total_tok
+                        stats["models"][current_model]["cost"] += cost
+                        stats["models"][current_model][
+                            "output_tokens"
+                        ] += output_tok + reasoning_tok
+
+                        if ts:
+                            stats["timestamps"].append(ts)
+                            if stats["start"] is None or ts < stats["start"]:
+                                stats["start"] = ts
+                            if stats["end"] is None or ts > stats["end"]:
+                                stats["end"] = ts
+
+                elif record_type == "response_item":
+                    payload_type = payload.get("type")
+
+                    if payload_type == "function_call":
+                        call_id = payload.get("call_id")
+                        tool_name = payload.get("name", "unknown")
+                        if call_id and ts:
+                            pending_tool_calls[call_id] = {
+                                "name": tool_name,
+                                "timestamp": ts,
+                            }
+
+                    elif payload_type == "function_call_output":
+                        call_id = payload.get("call_id")
+                        if ts and call_id and call_id in pending_tool_calls:
+                            call_info = pending_tool_calls.pop(call_id)
+                            tool_delta = (
+                                ts - call_info["timestamp"]
+                            ).total_seconds()
+                            if 0 < tool_delta < 600:
+                                stats["tool_time"] += tool_delta
+                                tool_name = call_info["name"]
+                                stats["tools"][tool_name]["calls"] += 1
+                                stats["tools"][tool_name]["time"] += tool_delta
+
+                    # Track timestamps from messages
+                    if ts:
+                        if stats["end"] is None or ts > stats["end"]:
+                            stats["end"] = ts
+
+    except Exception as e:
+        print(f"Error reading Codex session {filepath}: {e}")
+
+    stats["cwd"] = cwd
+    return stats
+
+
+def analyze_session_file(filepath: Path, source_type: str) -> SessionStats:
+    """Dispatch to the correct parser based on source type."""
+    if source_type == "claude":
+        return analyze_claude_jsonl_file(filepath)
+    elif source_type == "codex":
+        return analyze_codex_jsonl_file(filepath)
+    else:
+        return analyze_jsonl_file(filepath)
+
+
+def analyze_project(project_dir: Path, agent_cmd: str, source_type: str = "standard") -> ProjectStats | None:
     """Analyze all sessions in a project directory."""
     project_stats: ProjectStats = {
-        "name": get_project_path_from_jsonl(project_dir),
+        "name": get_project_path_from_jsonl(project_dir, source_type),
         "agent_cmd": agent_cmd,
         "sessions": [],
         "total_messages": 0,
@@ -450,7 +872,7 @@ def analyze_project(project_dir: Path, agent_cmd: str) -> ProjectStats | None:
         return None
 
     for filepath in sorted(jsonl_files):
-        stats = analyze_jsonl_file(filepath)
+        stats = analyze_session_file(filepath, source_type)
         if stats["messages"] == 0:
             continue
 
@@ -469,7 +891,7 @@ def analyze_project(project_dir: Path, agent_cmd: str) -> ProjectStats | None:
         if subagent_dir.exists() and subagent_dir.is_dir():
             # Find all JSONL files in the subagent directory
             for sub_jsonl in sorted(subagent_dir.rglob("*.jsonl")):
-                sub_stats = analyze_jsonl_file(sub_jsonl)
+                sub_stats = analyze_session_file(sub_jsonl, source_type)
                 if sub_stats["messages"] > 0:
                     sub_duration = (
                         (sub_stats["end"] - sub_stats["start"]).total_seconds()
@@ -482,9 +904,9 @@ def analyze_project(project_dir: Path, agent_cmd: str) -> ProjectStats | None:
                         sub_relative = sub_jsonl
 
                     # Get UID from file or generate random one
-                    sub_uid = get_session_id_from_file(str(sub_jsonl)) or str(
-                        uuid.uuid4()
-                    )
+                    sub_uid = get_session_id_from_file(
+                        str(sub_jsonl), source_type
+                    ) or str(uuid.uuid4())
 
                     sub_session = Session(
                         file=sub_jsonl.name,
@@ -545,7 +967,9 @@ def analyze_project(project_dir: Path, agent_cmd: str) -> ProjectStats | None:
                         ] / max(len(sub_stats["timestamps"]), 1)
 
         # Get UID from file or generate random one
-        session_uid = get_session_id_from_file(str(filepath)) or str(uuid.uuid4())
+        session_uid = get_session_id_from_file(str(filepath), source_type) or str(
+            uuid.uuid4()
+        )
 
         session = Session(
             file=filepath.name,
@@ -616,7 +1040,11 @@ def analyze_project(project_dir: Path, agent_cmd: str) -> ProjectStats | None:
 
 
 def export_session_to_html(session_path: str, agent_cmd: str) -> str:
-    """Export a session file to HTML using pi --export."""
+    """Export a session file to HTML.
+
+    For pi/omp: use agent_cmd --export.
+    For claude/codex: use standalone export scripts.
+    """
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
     # Create a unique output filename based on the session path
@@ -624,8 +1052,16 @@ def export_session_to_html(session_path: str, agent_cmd: str) -> str:
     output_file = TEMP_DIR / f"session_{session_hash}.html"
 
     try:
+        if agent_cmd == "claude":
+            script = Path(__file__).parent / "claude_export.py"
+            cmd = ["python3", str(script), session_path, str(output_file)]
+        elif agent_cmd == "codex":
+            script = Path(__file__).parent / "codex_export.py"
+            cmd = ["python3", str(script), session_path, str(output_file)]
+        else:
+            cmd = [agent_cmd, "--export", session_path, str(output_file)]
         result = subprocess.run(
-            [agent_cmd, "--export", session_path, str(output_file)],
+            cmd,
             capture_output=True,
             text=True,
             timeout=30,
@@ -638,18 +1074,168 @@ def export_session_to_html(session_path: str, agent_cmd: str) -> str:
     return f"<html><body><h1>Error exporting session</h1><pre>{html.escape(result.stderr)}</pre></body></html>"
 
 
-def get_session_cwd(session_path: str) -> str:
+def get_session_cwd(session_path: str, source_type: str = "standard") -> str:
     """Get the working directory from a session file."""
     try:
         with open(session_path, "r") as f:
-            first_line = f.readline().strip()
-            if first_line:
-                data = json.loads(first_line)
-                if data.get("type") == "session" and "cwd" in data:
-                    return data["cwd"]
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                data = json.loads(line)
+                if source_type == "claude":
+                    if data.get("type") in ("file-history-snapshot", "summary"):
+                        continue
+                    if data.get("cwd"):
+                        return data["cwd"]
+                elif source_type == "codex":
+                    if data.get("type") == "session_meta":
+                        return data.get("payload", {}).get("cwd", "")
+                else:
+                    if data.get("type") == "session" and "cwd" in data:
+                        return data["cwd"]
+                break
     except (OSError, json.JSONDecodeError, KeyError, TypeError):
         pass
     return ""
+
+
+def _build_codex_project_stats(
+    project_cwd: str, files: list[Path], agent_cmd: str
+) -> ProjectStats | None:
+    """Build a ProjectStats from a list of Codex session files grouped by cwd."""
+    project_stats: ProjectStats = {
+        "name": project_cwd,
+        "agent_cmd": agent_cmd,
+        "sessions": [],
+        "total_messages": 0,
+        "total_tokens": 0,
+        "total_output_tokens": 0,
+        "total_cost": 0.0,
+        "total_llm_time": 0.0,
+        "total_tool_time": 0.0,
+        "models": defaultdict(create_model_stats),
+        "tools": defaultdict(create_tool_stats),
+        "daily_stats": defaultdict(create_daily_stats),
+        "first_activity": None,
+        "last_activity": None,
+        "tps_samples": [],
+    }
+
+    for filepath in sorted(files):
+        stats = analyze_codex_jsonl_file(filepath)
+        if stats["messages"] == 0:
+            continue
+
+        duration = (
+            (stats["end"] - stats["start"]).total_seconds()
+            if stats["start"] and stats["end"]
+            else 0
+        )
+
+        session_uid = get_session_id_from_file(str(filepath), "codex") or str(
+            uuid.uuid4()
+        )
+
+        session = Session(
+            file=filepath.name,
+            path=str(filepath),
+            uid=session_uid,
+            relative_path=filepath.name,
+            cwd=stats["cwd"],
+            agent_cmd=agent_cmd,
+            messages=stats["messages"],
+            tokens=stats["total_tokens"],
+            output_tokens=stats["output_tokens"],
+            cost=stats["cost_total"],
+            start=stats["start"],
+            end=stats["end"],
+            duration=duration,
+            llm_time=stats["llm_time"],
+            tool_time=stats["tool_time"],
+            tools=dict(stats["tools"]),
+            avg_tps=calc_avg_tokens_per_sec(stats["tps_samples"]),
+            subagent_sessions=[],
+        )
+        SESSION_REGISTRY[session_uid] = session
+        project_stats["sessions"].append(session)
+
+        project_stats["total_messages"] += stats["messages"]
+        project_stats["total_tokens"] += stats["total_tokens"]
+        project_stats["total_output_tokens"] += stats["output_tokens"]
+        project_stats["total_cost"] += stats["cost_total"]
+        project_stats["total_llm_time"] += stats["llm_time"]
+        project_stats["total_tool_time"] += stats["tool_time"]
+        project_stats["tps_samples"].extend(stats["tps_samples"])
+
+        for model, mstats in stats["models"].items():
+            project_stats["models"][model]["messages"] += mstats["messages"]
+            project_stats["models"][model]["tokens"] += mstats["tokens"]
+            project_stats["models"][model]["cost"] += mstats["cost"]
+            project_stats["models"][model]["llm_time"] += mstats.get("llm_time", 0)
+            project_stats["models"][model]["output_tokens"] += mstats.get(
+                "output_tokens", 0
+            )
+
+        for tool_name, tstats in stats["tools"].items():
+            project_stats["tools"][tool_name]["calls"] += tstats["calls"]
+            project_stats["tools"][tool_name]["time"] += tstats["time"]
+            project_stats["tools"][tool_name]["errors"] += tstats["errors"]
+
+        for ts in stats["timestamps"]:
+            day_key = ts.strftime("%Y-%m-%d")
+            project_stats["daily_stats"][day_key]["messages"] += 1
+            project_stats["daily_stats"][day_key]["cost"] += stats[
+                "cost_total"
+            ] / max(len(stats["timestamps"]), 1)
+
+        if stats["start"]:
+            if (
+                project_stats["first_activity"] is None
+                or stats["start"] < project_stats["first_activity"]
+            ):
+                project_stats["first_activity"] = stats["start"]
+        if stats["end"]:
+            if (
+                project_stats["last_activity"] is None
+                or stats["end"] > project_stats["last_activity"]
+            ):
+                project_stats["last_activity"] = stats["end"]
+
+    return project_stats if project_stats["sessions"] else None
+
+
+def _accumulate_global_stats(
+    global_stats: GlobalStats, project_stats: ProjectStats
+) -> None:
+    """Accumulate project stats into global stats."""
+    global_stats["total_cost"] += project_stats["total_cost"]
+    global_stats["total_tokens"] += project_stats["total_tokens"]
+    global_stats["total_output_tokens"] += project_stats["total_output_tokens"]
+    global_stats["total_messages"] += project_stats["total_messages"]
+    global_stats["total_sessions"] += len(project_stats["sessions"])
+    global_stats["total_projects"] += 1
+    global_stats["total_llm_time"] += project_stats["total_llm_time"]
+    global_stats["total_tool_time"] += project_stats["total_tool_time"]
+    global_stats["tps_samples"].extend(project_stats["tps_samples"])
+
+    for model, mstats in project_stats["models"].items():
+        global_stats["models"][model]["messages"] += mstats["messages"]
+        global_stats["models"][model]["tokens"] += mstats["tokens"]
+        global_stats["models"][model]["cost"] += mstats["cost"]
+        global_stats["models"][model]["llm_time"] += mstats.get("llm_time", 0)
+        global_stats["models"][model]["output_tokens"] += mstats.get(
+            "output_tokens", 0
+        )
+
+    for tool_name, tstats in project_stats["tools"].items():
+        global_stats["tools"][tool_name]["calls"] += tstats["calls"]
+        global_stats["tools"][tool_name]["time"] += tstats["time"]
+        global_stats["tools"][tool_name]["errors"] += tstats["errors"]
+
+    for day, dstats in project_stats["daily_stats"].items():
+        global_stats["daily_stats"][day]["messages"] += dstats["messages"]
+        global_stats["daily_stats"][day]["cost"] += dstats["cost"]
 
 
 def collect_all_stats() -> tuple[list[ProjectStats], GlobalStats]:
@@ -673,48 +1259,39 @@ def collect_all_stats() -> tuple[list[ProjectStats], GlobalStats]:
         "tps_samples": [],
     }
 
-    for sessions_dir, agent_cmd in SESSIONS_DIRS:
+    for sessions_dir, agent_cmd, source_type in SESSIONS_DIRS:
         if not sessions_dir.exists():
             continue
 
+        if source_type == "codex":
+            # Codex: date-based hierarchy (YYYY/MM/DD/file.jsonl)
+            # Group sessions by cwd to create virtual "projects"
+            codex_projects: dict[str, list[Path]] = defaultdict(list)
+            for jsonl_file in sessions_dir.rglob("*.jsonl"):
+                cwd = get_session_cwd(str(jsonl_file), "codex")
+                key = cwd if cwd else "unknown"
+                codex_projects[key].append(jsonl_file)
+
+            for project_cwd, files in codex_projects.items():
+                # Create a temporary directory-like structure for analyze
+                # by building ProjectStats directly
+                project_stats = _build_codex_project_stats(
+                    project_cwd, files, agent_cmd
+                )
+                if project_stats and project_stats["sessions"]:
+                    all_projects.append(project_stats)
+                    _accumulate_global_stats(global_stats, project_stats)
+            continue
+
+        # Standard and Claude: iterate per-project subdirectories
         for project_dir in sessions_dir.iterdir():
             if not project_dir.is_dir() or project_dir.name.startswith("."):
                 continue
 
-            project_stats = analyze_project(project_dir, agent_cmd)
+            project_stats = analyze_project(project_dir, agent_cmd, source_type)
             if project_stats:
                 all_projects.append(project_stats)
-                global_stats["total_cost"] += project_stats["total_cost"]
-                global_stats["total_tokens"] += project_stats["total_tokens"]
-                global_stats["total_output_tokens"] += project_stats[
-                    "total_output_tokens"
-                ]
-                global_stats["total_messages"] += project_stats["total_messages"]
-                global_stats["total_sessions"] += len(project_stats["sessions"])
-                global_stats["total_projects"] += 1
-                global_stats["total_llm_time"] += project_stats["total_llm_time"]
-                global_stats["total_tool_time"] += project_stats["total_tool_time"]
-                global_stats["tps_samples"].extend(project_stats["tps_samples"])
-
-                for model, mstats in project_stats["models"].items():
-                    global_stats["models"][model]["messages"] += mstats["messages"]
-                    global_stats["models"][model]["tokens"] += mstats["tokens"]
-                    global_stats["models"][model]["cost"] += mstats["cost"]
-                    global_stats["models"][model]["llm_time"] += mstats.get(
-                        "llm_time", 0
-                    )
-                    global_stats["models"][model]["output_tokens"] += mstats.get(
-                        "output_tokens", 0
-                    )
-
-                for tool_name, tstats in project_stats["tools"].items():
-                    global_stats["tools"][tool_name]["calls"] += tstats["calls"]
-                    global_stats["tools"][tool_name]["time"] += tstats["time"]
-                    global_stats["tools"][tool_name]["errors"] += tstats["errors"]
-
-                for day, dstats in project_stats["daily_stats"].items():
-                    global_stats["daily_stats"][day]["messages"] += dstats["messages"]
-                    global_stats["daily_stats"][day]["cost"] += dstats["cost"]
+                _accumulate_global_stats(global_stats, project_stats)
 
     return all_projects, global_stats
 
@@ -869,7 +1446,7 @@ def generate_html():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Pi Agent Cost Dashboard</title>
+    <title>Agent Cost Dashboard</title>
     <style>
         :root {{
             --bg-primary: #0d1117;
@@ -1272,7 +1849,7 @@ def generate_html():
 </head>
 <body>
     <div class="container">
-        <h1>🤖 Pi Agent Cost Dashboard</h1>
+        <h1>🤖 Agent Cost Dashboard</h1>
         <p class="subtitle">Generated on {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} <span class="refresh-note">(Refresh page for updated stats)</span></p>
         
         <div class="stats-grid">
@@ -1496,7 +2073,7 @@ def generate_html():
         </div>
         
         <footer>
-            Agent Cost Dashboard • Data from ~/.pi and ~/.omp
+            Agent Cost Dashboard • Data from ~/.pi, ~/.omp, ~/.claude, and ~/.codex
         </footer>
     </div>
     
@@ -1504,6 +2081,16 @@ def generate_html():
         const projects = """
         + json.dumps(projects_json)
         + """;
+
+        function buildResumeCmd(agentCmd, cwd, sessionPath, sessionUid) {
+            if (agentCmd === 'claude') {
+                return 'cd "' + cwd + '" && claude --resume "' + sessionUid + '"';
+            } else if (agentCmd === 'codex') {
+                return 'cd "' + cwd + '" && codex --resume "' + sessionUid + '"';
+            } else {
+                return 'cd "' + cwd + '" && ' + agentCmd + ' --session "' + sessionPath + '"';
+            }
+        }
 
         function formatDuration(seconds) {
             if (seconds < 60) {
@@ -1699,7 +2286,7 @@ def generate_html():
                 if (!hasSubs) {
                     const sessionUrl = '/session?uid=' + encodeURIComponent(s.uid);
                     const resumePath = s.path.replace(/\\\\/g, '/');
-                    const resumeCmd = 'cd "' + s.cwd + '" && ' + s.agent_cmd + ' --session "' + resumePath + '"';
+                    const resumeCmd = buildResumeCmd(s.agent_cmd, s.cwd, resumePath, s.uid);
                     const encodedCmd = encodeURIComponent(resumeCmd);
                     const shortProject = s.cwd.length > 40 ? '...' + s.cwd.slice(-37) : s.cwd;
 
@@ -1750,7 +2337,7 @@ def generate_html():
                 // Summary row with resume/open buttons
                 const sessionUrl = '/session?uid=' + encodeURIComponent(s.uid);
                 const resumePath = s.path.replace(/\\\\/g, '/');
-                const resumeCmd = 'cd "' + s.cwd + '" && ' + s.agent_cmd + ' --session "' + resumePath + '"';
+                const resumeCmd = buildResumeCmd(s.agent_cmd, s.cwd, resumePath, s.uid);
                 const encodedCmd = encodeURIComponent(resumeCmd);
 
                 // Calculate average tokens/sec for aggregated sessions
@@ -1807,7 +2394,7 @@ def generate_html():
                     const subSessionUrl = '/session?uid=' + encodeURIComponent(sub.uid);
                     const subResumePath = sub.path.replace(/\\\\/g, '/');
                     // Use parent session's agent_cmd for subagent resume command
-                    const subResumeCmd = 'cd "' + sub.cwd + '" && ' + s.agent_cmd + ' --session "' + subResumePath + '"';
+                    const subResumeCmd = buildResumeCmd(s.agent_cmd, sub.cwd, subResumePath, sub.uid);
                     const subEncodedCmd = encodeURIComponent(subResumeCmd);
 
                     // Just show the filename, not the full relative path
@@ -1995,7 +2582,7 @@ def main():
     args = parser.parse_args()
 
     # Check if any sessions directory exists
-    any_exists = any(sessions_dir.exists() for sessions_dir, _ in SESSIONS_DIRS)
+    any_exists = any(sessions_dir.exists() for sessions_dir, _, _ in SESSIONS_DIRS)
     if not any_exists:
         print("⚠️  No sessions directories found. No data to display yet.")
 
@@ -2007,10 +2594,10 @@ def main():
             socketserver.TCPServer.server_bind(self)
 
     httpd = DashboardServer((args.host, args.port), DashboardHandler)
-    print("🚀 Agent Cost Dashboard")
+    print("🚀 Agent Cost Dashboard (pi, omp, claude, codex)")
     print(f"   Serving on: http://{args.host}:{args.port}")
     print("   Data from:")
-    for sessions_dir, agent_cmd in SESSIONS_DIRS:
+    for sessions_dir, agent_cmd, source_type in SESSIONS_DIRS:
         exists = "✓" if sessions_dir.exists() else "✗"
         print(f"     {exists} {sessions_dir} ({agent_cmd})")
     print("\n   Press Ctrl+C to stop\n")
