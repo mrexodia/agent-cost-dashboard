@@ -1,56 +1,50 @@
 # Agent Cost Dashboard
 
-Interactive web dashboard to monitor and analyze your [Pi](https://github.com/mariozechner/pi-coding-agent) and [Oh My Pi](https://github.com/can1357/oh-my-pi) coding agent API costs.
+Web dashboard to monitor API costs for [Pi](https://github.com/mariozechner/pi-coding-agent), [Oh My Pi](https://github.com/can1357/oh-my-pi), [Claude Code](https://github.com/anthropics/claude-code), and [Codex CLI](https://github.com/openai/codex) coding agents.
+
+No external dependencies — pure Python stdlib.
 
 ![Main dashboard showing global stats, and daily spending](screenshots/dashboard-overview.png)
 
 ## Features
 
-### 📊 Global Statistics
-Track your total spending across all projects and sessions:
-- **Total cost** with breakdown by input, output, and cache tokens
-- **Token usage** across all models
-- **Session count** and project count
-- **LLM time** vs tool execution time
-- **Average tokens per second** across all API calls
+### Global Statistics
+Track total spending across all projects and sessions:
+- Total cost with breakdown by input, output, and cache tokens
+- Token usage across all models
+- Session count and project count
+- LLM time vs tool execution time
+- Average tokens per second across all API calls
 
-### 📈 Daily Spending Chart
-Visual timeline of your API costs over time, helping you spot trends and usage patterns.
+### Daily Spending Chart
+Timeline of API costs over time.
 
-### 🤖 Model Breakdown
-See costs broken down by AI model (Claude Opus, Sonnet, Gemini, etc.):
-- Messages per model
-- Token usage per model
-- Cost per model
+### Model Breakdown
+Costs broken down by AI model (Claude, Gemini, GPT-5, O3, O4, GLM, etc.):
+- Messages, token usage, and cost per model
 - Average tokens per second
 
 ![Model Stats](screenshots/model-stats.png)
 
-### 🔧 Tool Usage
+### Tool Usage
 Track which tools your agent uses most:
-- Call counts per tool
-- Execution time per tool
+- Call counts and execution time per tool
 - Error rates
 
 ![Tool Stats](screenshots/tool-stats.png)
 
-### 📁 Project View
-All your projects with expandable details:
-- Per-project cost breakdown
-- Model usage per project
-- Tool usage per project
-- Session history per project
-- Average tokens per second
+### Project View
+All projects with expandable details:
+- Per-project cost, model usage, tool usage, and session history
 - Sortable by cost, tokens, LLM time, or date
 
 ![Projects](screenshots/projects.png)
 
-### 📜 Session Browser
+### Session Browser
 Browse every session with full details:
 - Copy command to resume session to the clipboard
-- Full transcript export (opens in browser via `pi --export`)
+- Full transcript export (Pi via `pi --export`, Claude and Codex via built-in exporters)
 - Session duration, LLM time, and tool time
-- Average tokens per second
 - Subagent session support with expandable grouping
 - Sortable by date, duration, cost, tokens, and more
 
@@ -58,15 +52,9 @@ Browse every session with full details:
 
 ## Installation
 
-### Requirements
-
-- **Python 3.12+**
-- **Pi** ([install guide](https://github.com/mariozechner/pi-coding-agent)) and/or **Oh My Pi** ([install guide](https://github.com/can1357/oh-my-pi))
-
-### Setup
+Requires **Python 3.12+**.
 
 ```bash
-# Clone this repository
 git clone https://github.com/user/pi-cost-dashboard
 cd pi-cost-dashboard
 ```
@@ -87,13 +75,44 @@ cd pi-cost-dashboard
 ./cost_dashboard.py -H 0.0.0.0 -p 3000
 ```
 
+On Windows, you can also double-click `start.bat`.
+
 Then open http://localhost:8753 in your browser.
 
-The dashboard automatically reads session data from `~/.pi/agent/sessions` and `~/.omp/agent/sessions`.
+## Session Directories
+
+The dashboard automatically reads session data from:
+
+| Agent | Directory |
+|---|---|
+| Pi | `~/.pi/agent/sessions` |
+| Oh My Pi | `~/.omp/agent/sessions` |
+| Claude Code | `~/.claude/projects` |
+| Codex CLI | `~/.codex/sessions` |
+
+## CLI Utilities
+
+### claude_cost.py
+
+Calculate API costs for Claude Code sessions:
+
+```bash
+python claude_cost.py /path/to/sessions
+python claude_cost.py /path/to/session.jsonl
+```
+
+### claude_export.py / codex_export.py
+
+Export a session JSONL file to a styled HTML transcript:
+
+```bash
+python claude_export.py input.jsonl output.html
+python codex_export.py input.jsonl output.html
+```
 
 ## Pricing
 
-The dashboard calculates costs using the pricing reported by the Pi agent. For models that don't report costs (like Gemini via Google Cloud), estimated pricing is applied based on public API rates.
+Costs are calculated using pricing reported by the agent. For models that don't report costs (e.g., Gemini via Google Cloud), estimated pricing is applied based on public API rates. Supported model families: Claude, Gemini, GPT-5, O3/O4, GLM.
 
 ## Credits
 
