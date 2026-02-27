@@ -238,6 +238,28 @@ MANUAL_PRICING = {
         "cache_write": 0.0,
     },
     # OpenAI/Codex models (estimated pricing)
+    # Put codex-specific patterns before generic gpt-* patterns.
+    # Codex cache pricing is lower than normal input pricing.
+    "gpt-5.3-codex": {
+        "input": 1.75,
+        "output": 14.0,
+        "cache_read": 0.175,
+    },
+    "gpt-5.2-codex": {
+        "input": 1.5,
+        "output": 10.0,
+        "cache_read": 0.15,
+    },
+    "gpt-5.1-codex": {
+        "input": 1.5,
+        "output": 10.0,
+        "cache_read": 0.15,
+    },
+    "gpt-5-codex": {
+        "input": 1.5,
+        "output": 10.0,
+        "cache_read": 0.15,
+    },
     "gpt-5": {
         "input": 2.0,
         "output": 8.0,
@@ -435,7 +457,11 @@ def analyze_jsonl_file(filepath: Path) -> SessionStats:
 
                             if reported_cost == 0:
                                 reported_cost = get_manual_cost(
-                                    model, input_tok, output_tok, cache_read_tok
+                                    model,
+                                    input_tok,
+                                    output_tok,
+                                    cache_read_tok,
+                                    cache_write_tok,
                                 )
 
                             stats["messages"] += 1
@@ -691,10 +717,78 @@ def analyze_codex_jsonl_file(filepath: Path) -> SessionStats:
     """Analyze a Codex CLI JSONL session file and return stats.
 
     Codex format uses record types: session_meta, turn_context, event_msg, response_item.
-    Usage is in event_msg records where payload.type == "token_count" with
-    payload.info.last_token_usage fields. Tool calls are response_item with
-    payload.type == "function_call"/"function_call_output".
+    Usage is in event_msg records where payload.type == "token_count".
+    We prefer last_token_usage deltas when available, otherwise derive deltas from
+    total_token_usage using running totals.
     """
+
+    def to_nonneg_int(value) -> int:
+        try:
+            if value is None:
+                return 0
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            try:
+                return max(0, int(float(value)))
+            except (TypeError, ValueError):
+                return 0
+
+    def parse_usage(usage_obj: dict | None) -> dict | None:
+        if not isinstance(usage_obj, dict):
+            return None
+
+        raw_input = to_nonneg_int(usage_obj.get("input_tokens", 0))
+        cache_read = to_nonneg_int(usage_obj.get("cached_input_tokens", 0))
+        output = to_nonneg_int(usage_obj.get("output_tokens", 0))
+        reasoning = to_nonneg_int(usage_obj.get("reasoning_output_tokens", 0))
+
+        # Codex input_tokens includes cached_input_tokens. Store net input to avoid
+        # double counting input + cache read in totals and manual pricing.
+        input_net = max(0, raw_input - cache_read)
+
+        # Match ccusage semantics: billable total excludes reasoning breakdown
+        # and avoids relying on provider-specific total_tokens behavior.
+        total = input_net + output + cache_read
+
+        return {
+            "input_tokens": input_net,
+            "output_tokens": output,
+            "reasoning_tokens": reasoning,
+            "cache_read_tokens": cache_read,
+            "total_tokens": total,
+        }
+
+    def subtract_usage(current: dict, previous: dict) -> dict:
+        return {
+            "input_tokens": max(
+                0, current["input_tokens"] - previous["input_tokens"]
+            ),
+            "output_tokens": max(
+                0, current["output_tokens"] - previous["output_tokens"]
+            ),
+            "reasoning_tokens": max(
+                0, current["reasoning_tokens"] - previous["reasoning_tokens"]
+            ),
+            "cache_read_tokens": max(
+                0,
+                current["cache_read_tokens"] - previous["cache_read_tokens"],
+            ),
+            "total_tokens": max(
+                0, current["total_tokens"] - previous["total_tokens"]
+            ),
+        }
+
+    def add_usage(left: dict, right: dict) -> dict:
+        return {
+            "input_tokens": left["input_tokens"] + right["input_tokens"],
+            "output_tokens": left["output_tokens"] + right["output_tokens"],
+            "reasoning_tokens": left["reasoning_tokens"]
+            + right["reasoning_tokens"],
+            "cache_read_tokens": left["cache_read_tokens"]
+            + right["cache_read_tokens"],
+            "total_tokens": left["total_tokens"] + right["total_tokens"],
+        }
+
     stats: SessionStats = {
         "messages": 0,
         "input_tokens": 0,
@@ -717,7 +811,7 @@ def analyze_codex_jsonl_file(filepath: Path) -> SessionStats:
     cwd = ""
     model = ""
     pending_tool_calls = {}  # call_id -> {"name": str, "timestamp": datetime}
-    last_total_usage = None  # For deduplication of token_count events
+    previous_total_usage = None
 
     try:
         with open(filepath, "r") as f:
@@ -729,6 +823,8 @@ def analyze_codex_jsonl_file(filepath: Path) -> SessionStats:
 
                 record_type = data.get("type")
                 payload = data.get("payload", {})
+                if not isinstance(payload, dict):
+                    payload = {}
                 ts = parse_timestamp(data.get("timestamp"))
 
                 if record_type == "session_meta":
@@ -739,67 +835,89 @@ def analyze_codex_jsonl_file(filepath: Path) -> SessionStats:
                             stats["start"] = ts
 
                 elif record_type == "turn_context":
-                    # Get the model from turn_context
                     if payload.get("model"):
                         model = payload["model"]
 
                 elif record_type == "event_msg":
-                    if payload.get("type") == "token_count":
-                        info = payload.get("info")
-                        if not info:
-                            continue
-                        last_usage = info.get("last_token_usage", {})
-                        total_usage = info.get("total_token_usage", {})
+                    if payload.get("type") != "token_count":
+                        continue
 
-                        # Deduplicate: skip if total_usage matches previous
-                        total_key = (
-                            total_usage.get("input_tokens", 0),
-                            total_usage.get("output_tokens", 0),
-                            total_usage.get("total_tokens", 0),
+                    info = payload.get("info")
+                    if not isinstance(info, dict):
+                        continue
+
+                    last_usage = parse_usage(info.get("last_token_usage"))
+                    total_usage = parse_usage(info.get("total_token_usage"))
+
+                    delta_usage = None
+                    latest_total_usage = None
+
+                    if last_usage:
+                        delta_usage = last_usage
+                        latest_total_usage = total_usage
+                    elif total_usage:
+                        delta_usage = (
+                            subtract_usage(total_usage, previous_total_usage)
+                            if previous_total_usage
+                            else total_usage
                         )
-                        if total_key == last_total_usage:
-                            continue
-                        last_total_usage = total_key
+                        latest_total_usage = total_usage
 
-                        input_tok = last_usage.get("input_tokens", 0)
-                        output_tok = last_usage.get("output_tokens", 0)
-                        cache_read_tok = last_usage.get("cached_input_tokens", 0)
-                        reasoning_tok = last_usage.get(
-                            "reasoning_output_tokens", 0
+                    if not delta_usage:
+                        continue
+
+                    has_usage_signal = (
+                        delta_usage["input_tokens"] > 0
+                        or delta_usage["output_tokens"] > 0
+                        or delta_usage["reasoning_tokens"] > 0
+                        or delta_usage["cache_read_tokens"] > 0
+                        or delta_usage["total_tokens"] > 0
+                    )
+                    if not has_usage_signal:
+                        if latest_total_usage:
+                            previous_total_usage = latest_total_usage
+                        continue
+
+                    input_tok = delta_usage["input_tokens"]
+                    output_tok = delta_usage["output_tokens"]
+                    cache_read_tok = delta_usage["cache_read_tokens"]
+                    reasoning_tok = delta_usage["reasoning_tokens"]
+                    total_tok = delta_usage["total_tokens"]
+
+                    cost = get_manual_cost(
+                        model, input_tok, output_tok, cache_read_tok
+                    )
+
+                    stats["messages"] += 1
+                    stats["input_tokens"] += input_tok
+                    stats["output_tokens"] += output_tok + reasoning_tok
+                    stats["cache_read_tokens"] += cache_read_tok
+                    stats["total_tokens"] += total_tok
+                    stats["cost_total"] += cost
+
+                    current_model = model or "unknown"
+                    stats["models"][current_model]["messages"] += 1
+                    stats["models"][current_model]["tokens"] += total_tok
+                    stats["models"][current_model]["cost"] += cost
+                    stats["models"][current_model]["output_tokens"] += (
+                        output_tok + reasoning_tok
+                    )
+
+                    if ts:
+                        stats["timestamps"].append(ts)
+                        if stats["start"] is None or ts < stats["start"]:
+                            stats["start"] = ts
+                        if stats["end"] is None or ts > stats["end"]:
+                            stats["end"] = ts
+
+                    if latest_total_usage:
+                        previous_total_usage = latest_total_usage
+                    elif previous_total_usage:
+                        previous_total_usage = add_usage(
+                            previous_total_usage, delta_usage
                         )
-                        total_tok = last_usage.get(
-                            "total_tokens",
-                            input_tok + output_tok + cache_read_tok,
-                        )
-
-                        if total_tok == 0:
-                            continue
-
-                        cost = get_manual_cost(
-                            model, input_tok, output_tok, cache_read_tok
-                        )
-
-                        stats["messages"] += 1
-                        stats["input_tokens"] += input_tok
-                        stats["output_tokens"] += output_tok + reasoning_tok
-                        stats["cache_read_tokens"] += cache_read_tok
-                        stats["total_tokens"] += total_tok
-                        stats["cost_total"] += cost
-
-                        current_model = model or "unknown"
-                        stats["models"][current_model]["messages"] += 1
-                        stats["models"][current_model]["tokens"] += total_tok
-                        stats["models"][current_model]["cost"] += cost
-                        stats["models"][current_model][
-                            "output_tokens"
-                        ] += output_tok + reasoning_tok
-
-                        if ts:
-                            stats["timestamps"].append(ts)
-                            if stats["start"] is None or ts < stats["start"]:
-                                stats["start"] = ts
-                            if stats["end"] is None or ts > stats["end"]:
-                                stats["end"] = ts
+                    else:
+                        previous_total_usage = delta_usage
 
                 elif record_type == "response_item":
                     payload_type = payload.get("type")
@@ -826,7 +944,6 @@ def analyze_codex_jsonl_file(filepath: Path) -> SessionStats:
                                 stats["tools"][tool_name]["calls"] += 1
                                 stats["tools"][tool_name]["time"] += tool_delta
 
-                    # Track timestamps from messages
                     if ts:
                         if stats["end"] is None or ts > stats["end"]:
                             stats["end"] = ts
