@@ -13,6 +13,8 @@ import html
 import http.server
 import socketserver
 import argparse
+import shlex
+import sys
 from typing import TypedDict, DefaultDict
 
 
@@ -1171,14 +1173,22 @@ def export_session_to_html(session_path: str, agent_cmd: str) -> str:
     output_file = TEMP_DIR / f"session_{session_hash}.html"
 
     try:
-        if agent_cmd == "claude":
+        try:
+            base_cmd = shlex.split(agent_cmd)
+        except ValueError:
+            base_cmd = agent_cmd.split()
+
+        agent_name = Path(base_cmd[0]).name.lower() if base_cmd else ""
+
+        if agent_name.startswith("claude"):
             script = Path(__file__).parent / "claude_export.py"
-            cmd = ["python3", str(script), session_path, str(output_file)]
-        elif agent_cmd == "codex":
+            cmd = [sys.executable or "python3", str(script), session_path, str(output_file)]
+        elif agent_name.startswith("codex"):
             script = Path(__file__).parent / "codex_export.py"
-            cmd = ["python3", str(script), session_path, str(output_file)]
+            cmd = [sys.executable or "python3", str(script), session_path, str(output_file)]
         else:
-            cmd = [agent_cmd, "--export", session_path, str(output_file)]
+            cmd = [*base_cmd, "--export", session_path, str(output_file)]
+
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -1190,7 +1200,8 @@ def export_session_to_html(session_path: str, agent_cmd: str) -> str:
     except Exception as e:
         return f"<html><body><h1>Error exporting session</h1><pre>{html.escape(str(e))}</pre></body></html>"
 
-    return f"<html><body><h1>Error exporting session</h1><pre>{html.escape(result.stderr)}</pre></body></html>"
+    error_text = result.stderr or result.stdout or "Unknown export error"
+    return f"<html><body><h1>Error exporting session</h1><pre>{html.escape(error_text)}</pre></body></html>"
 
 
 def get_session_cwd(session_path: str, source_type: str = "standard") -> str:
