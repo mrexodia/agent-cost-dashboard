@@ -181,38 +181,82 @@ def get_session_id_from_file(
     return None
 
 
-# Manual pricing for models that report zero cost (price per million tokens)
+# Manual pricing for models that report zero cost (price per million tokens).
 # Format: model_pattern -> {"input": price_per_M, "output": price_per_M, "cache_read": price_per_M}
+# Prices sourced from OpenRouter (openrouter.ai/api/v1/models) as of 2026-02.
+#
+# Rules:
+#  - Only add entries for specific known model versions. No broad family prefixes
+#    (e.g. "gpt-5", "gpt-4") — a generic pattern can silently misprice a totally
+#    different model in the same family at a wildly wrong rate.
+#  - More specific patterns must appear before less specific ones (dict is ordered).
+#  - Cache pricing from provider docs where available; 0.0 where unknown.
 MANUAL_PRICING = {
-    # Gemini models via Google Cloud Code Assist (free tier, but estimate value)
-    # Pricing based on public Gemini API pricing as of Dec 2024
+    # ── Gemini (Google Cloud Code Assist / OpenRouter) ────────────────────────
     "gemini-2.5-pro": {
-        "input": 1.25,  # $1.25 per 1M input tokens
-        "output": 10.00,  # $10.00 per 1M output tokens (with thinking)
-        "cache_read": 0.31,  # $0.3125 per 1M cached tokens
+        "input": 1.25,
+        "output": 10.00,
+        "cache_read": 0.31,
     },
     "gemini-2.5-flash": {
-        "input": 0.15,  # $0.15 per 1M input tokens
-        "output": 0.60,  # $0.60 per 1M output tokens
-        "cache_read": 0.0375,
+        "input": 0.30,
+        "output": 2.50,
+        "cache_read": 0.075,
     },
     "gemini-2.0-flash": {
         "input": 0.10,
         "output": 0.40,
         "cache_read": 0.025,
     },
-    "gemini-3-pro-preview": {
-        # Use same pricing as gemini-2.5-pro as estimate
-        "input": 1.25,
-        "output": 10.00,
-        "cache_read": 0.31,
+    "gemini-3-flash-preview": {
+        "input": 0.50,
+        "output": 3.00,
+        "cache_read": 0.0,
     },
-    # Claude models (per 1M tokens) - from Anthropic API pricing
-    "claude-opus-4": {
+    "gemini-3-pro-preview": {
+        "input": 2.00,
+        "output": 12.00,
+        "cache_read": 0.0,
+    },
+    "gemini-3.1-pro-preview": {
+        "input": 2.00,
+        "output": 12.00,
+        "cache_read": 0.0,
+    },
+    # ── Claude (Anthropic API pricing per 1M tokens) ──────────────────────────
+    # Specific version strings avoid mislabelling different-priced variants.
+    # pi sessions use hyphens (claude-opus-4-5); direct API / OR use dots (4.5).
+    # claude-opus-4.5 / 4.6 — $5/$25
+    "claude-opus-4.5": {
         "input": 5.0,
         "output": 25.0,
         "cache_read": 0.5,
         "cache_write": 6.25,
+    },
+    "claude-opus-4-5": {
+        "input": 5.0,
+        "output": 25.0,
+        "cache_read": 0.5,
+        "cache_write": 6.25,
+    },
+    "claude-opus-4.6": {
+        "input": 5.0,
+        "output": 25.0,
+        "cache_read": 0.5,
+        "cache_write": 6.25,
+    },
+    "claude-opus-4-6": {
+        "input": 5.0,
+        "output": 25.0,
+        "cache_read": 0.5,
+        "cache_write": 6.25,
+    },
+    # claude-opus-4.0 / 4.1 — $15/$75 (different, more expensive model)
+    "claude-opus-4.1": {
+        "input": 15.0,
+        "output": 75.0,
+        "cache_read": 1.5,
+        "cache_write": 18.75,
     },
     "claude-sonnet-4": {
         "input": 3.0,
@@ -226,51 +270,47 @@ MANUAL_PRICING = {
         "cache_read": 0.1,
         "cache_write": 1.25,
     },
-    # GLM models
+    # ── GLM (Z-AI / ZhipuAI) ─────────────────────────────────────────────────
     "glm-4.7": {
-        "input": 0.4,
-        "output": 1.0,
+        "input": 0.30,
+        "output": 1.40,
         "cache_read": 0.0,
         "cache_write": 0.0,
     },
     "glm-4.5-air": {
-        "input": 0.2,
-        "output": 1.1,
-        "cache_read": 0.03,
+        "input": 0.13,
+        "output": 0.85,
+        "cache_read": 0.0,
         "cache_write": 0.0,
     },
-    # OpenAI/Codex models (estimated pricing)
-    # Put codex-specific patterns before generic gpt-* patterns.
-    # Codex cache pricing is lower than normal input pricing.
+    # ── Grok (xAI) ───────────────────────────────────────────────────────────
+    "grok-code-fast-1": {
+        "input": 0.20,
+        "output": 1.50,
+        "cache_read": 0.0,
+    },
+    # ── OpenAI / Codex ────────────────────────────────────────────────────────
+    # More specific patterns before less specific ones.
+    # Cache pricing ~10% of input (Codex CLI product rate).
     "gpt-5.3-codex": {
         "input": 1.75,
         "output": 14.0,
         "cache_read": 0.175,
     },
     "gpt-5.2-codex": {
-        "input": 1.5,
-        "output": 10.0,
-        "cache_read": 0.15,
+        "input": 1.75,
+        "output": 14.0,
+        "cache_read": 0.175,
     },
     "gpt-5.1-codex": {
-        "input": 1.5,
+        "input": 1.25,
         "output": 10.0,
-        "cache_read": 0.15,
+        "cache_read": 0.125,
     },
     "gpt-5-codex": {
-        "input": 1.5,
+        "input": 1.25,
         "output": 10.0,
-        "cache_read": 0.15,
-    },
-    "gpt-5": {
-        "input": 2.0,
-        "output": 8.0,
-        "cache_read": 0.5,
-    },
-    "gpt-4": {
-        "input": 2.5,
-        "output": 10.0,
-        "cache_read": 1.25,
+        "cache_read": 0.125,
     },
     "o3": {
         "input": 2.0,
@@ -2717,7 +2757,9 @@ def main():
         print("⚠️  No sessions directories found. No data to display yet.")
 
     # Start server
-    class DashboardServer(socketserver.TCPServer):
+    class DashboardServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+        daemon_threads = True  # clean shutdown on Ctrl+C
+
         def server_bind(self):
             # Allow port reuse to avoid "Address already in use" on quick restart
             self.allow_reuse_address = True
