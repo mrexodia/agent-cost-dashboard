@@ -140,6 +140,7 @@ def create_daily_stats() -> DailyStats:
 # source_type: "standard" (pi/omp), "claude" (~/.claude/projects), "codex" (~/.codex/sessions)
 SESSIONS_DIRS = [
     (Path.home() / ".pi" / "agent" / "sessions", "pi", "standard"),
+    (Path.home() / "agentbox" / "config" / ".pi" / "agent" / "sessions", "pi", "standard"),
     (Path.home() / ".omp" / "agent" / "sessions", "omp", "standard"),
     (Path.home() / ".claude" / "projects", "claude", "claude"),
     (Path.home() / ".codex" / "sessions", "codex", "codex"),
