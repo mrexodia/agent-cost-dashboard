@@ -187,7 +187,8 @@ def get_session_id_from_file(
 ) -> str | None:
     """Extract session ID from a JSONL file.
 
-    For standard (pi/omp): first line {"type":"session","id":"..."}
+    For standard (pi/omp): read the ID from the session record. Newer OMP
+    files may put an in-place title metadata record before it.
     For claude: use the filename stem (UUID)
     For codex: read session_meta.payload.id
     """
@@ -196,15 +197,19 @@ def get_session_id_from_file(
 
     try:
         with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-            first_line = f.readline().strip()
-            if first_line:
-                data = json.loads(first_line)
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
                 if source_type == "codex":
                     if data.get("type") == "session_meta":
                         return data.get("payload", {}).get("id")
-                else:
-                    if data.get("type") == "session" and "id" in data:
-                        return data["id"]
+                elif data.get("type") == "session" and "id" in data:
+                    return data["id"]
     except (OSError, json.JSONDecodeError, KeyError, TypeError):
         pass
     return None
@@ -907,9 +912,13 @@ def get_project_path_from_jsonl(project_dir, source_type: str = "standard"):
                         # For Gemini, the project name is the parent of the chats directory
                         return project_dir.parent.name
                     else:
-                        if data.get("type") == "session" and "cwd" in data:
-                            return data["cwd"]
-                    break  # Only check first relevant line
+                        # OMP 17+ reserves the first line for mutable title
+                        # metadata, so keep scanning until the session record.
+                        if data.get("type") == "session":
+                            cwd = data.get("cwd")
+                            if cwd:
+                                return cwd
+                            break
         except (OSError, json.JSONDecodeError, KeyError, TypeError):
             continue
     return project_dir.name
@@ -925,20 +934,12 @@ def analyze_jsonl_file(filepath: Path) -> SessionStats:
 
     try:
         with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-            # First, try to read cwd from the session line
-            first_line = f.readline().strip()
-            if first_line:
-                try:
-                    session_data = json.loads(first_line)
-                    if session_data.get("type") == "session":
-                        cwd = session_data.get("cwd", "")
-                except (json.JSONDecodeError, TypeError):
-                    pass
-
-            # Now process the rest of the file
             for line in f:
                 try:
                     data = json.loads(line.strip())
+                    if data.get("type") == "session":
+                        cwd = data.get("cwd", cwd)
+                        continue
                     if data.get("type") != "message" or "message" not in data:
                         continue
 
