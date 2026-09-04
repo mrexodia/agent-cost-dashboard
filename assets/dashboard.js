@@ -3,7 +3,7 @@
 const dashboardData = window.dashboardData || {};
 
 (function() {
-    const dailyStats = dashboardData.dailyStats || [];
+    let dailyStats = dashboardData.dailyStats || [];
 
     // Collect all model names ordered by total cost (highest first)
     const modelTotals = {};
@@ -48,7 +48,10 @@ const dashboardData = window.dashboardData || {};
 
     function render() {
         const visible = getVisibleDays();
-        if (!visible.length) return;
+        if (!visible.length) {
+            document.getElementById('daily-chart-content').innerHTML = '<div class="filter-help">No spending data for this range.</div>';
+            return;
+        }
 
         const maxCost = Math.max(...visible.map(d => d.cost), 0.0001);
 
@@ -166,10 +169,17 @@ const dashboardData = window.dashboardData || {};
         render();
     };
 
+    window.setDailyStats = function(stats) {
+        dailyStats = stats || [];
+        showAll = false;
+        render();
+    };
+
     render();
 })();
 
-const projects = dashboardData.projects || [];
+const allProjects = dashboardData.projects || [];
+let projects = allProjects;
 
 function buildResumeCmd(agentCmd, cwd, sessionPath, sessionUid) {
     if (agentCmd === 'claude') {
@@ -250,9 +260,16 @@ function tokenValue(item, field) {
     return Number(item?.[field] || 0);
 }
 
+function formatTokenValue(item, field, compact = true) {
+    const value = compact
+        ? formatCompactNumber(tokenValue(item, field))
+        : formatFullNumber(tokenValue(item, field));
+    return item?.tokens_estimated ? `~${value}` : value;
+}
+
 function tokenTitle(item) {
     return [
-        `Total: ${formatFullNumber(tokenValue(item, 'tokens'))}`,
+        `${item?.tokens_estimated ? 'Estimated ' : ''}Total: ${formatFullNumber(tokenValue(item, 'tokens'))}`,
         ...TOKEN_DETAIL_FIELDS.map(
             ([label, field]) => `${label}: ${formatFullNumber(tokenValue(item, field))}`
         ),
@@ -264,19 +281,20 @@ function tokenDetailText(item, compact = false) {
     return TOKEN_DETAIL_FIELDS
         .map(([label, field]) => [label, tokenValue(item, field)])
         .filter(([, value]) => value > 0)
-        .map(([label, value]) => `${label} ${formatter(value)}`)
+        .map(([label, value]) => `${label} ${item?.tokens_estimated ? '~' : ''}${formatter(value)}`)
         .join(' · ');
 }
 
 function tokenCellHtml(item) {
-    return `<span class="token-cell" title="${escapeHtml(tokenTitle(item))}">${formatCompactNumber(tokenValue(item, 'tokens'))}</span>`;
+    return `<span class="token-cell" title="${escapeHtml(tokenTitle(item))}">${formatTokenValue(item, 'tokens')}</span>`;
 }
 
 function aggregateTokenCounts(items) {
-    const totals = {tokens: 0};
+    const totals = {tokens: 0, tokens_estimated: false};
     TOKEN_DETAIL_FIELDS.forEach(([, field]) => { totals[field] = 0; });
     items.forEach(item => {
         totals.tokens += tokenValue(item, 'tokens');
+        totals.tokens_estimated ||= Boolean(item?.tokens_estimated);
         TOKEN_DETAIL_FIELDS.forEach(([, field]) => {
             totals[field] += tokenValue(item, field);
         });
@@ -313,7 +331,7 @@ function renderProjects() {
             <div class="model-item">
                 <span class="model-name">${escapeHtml(m.name)}</span>
                 <span class="model-stat" title="${formatFullNumber(m.messages)} msgs">${formatCompactNumber(m.messages)} msgs</span>
-                <span class="model-stat token-wide" title="${escapeHtml(tokenTitle(m))}">${formatCompactNumber(m.tokens)} tok</span>
+                <span class="model-stat token-wide" title="${escapeHtml(tokenTitle(m))}">${formatTokenValue(m, 'tokens')} tok</span>
                 <span class="model-stat token-detail-wide">${escapeHtml(tokenDetailText(m, true))}</span>
                 <span class="model-stat" style="color: var(--accent-blue)">${(m.avg_tps || 0).toFixed(1)} tok/s</span>
                 <span class="model-stat cost">$${m.cost.toFixed(2)}</span>
@@ -347,7 +365,7 @@ function renderProjects() {
                 <td colspan="9">
                     <div class="model-tree">
                         <div class="detail-line"><strong>Path:</strong> ${escapeHtml(p.name)}</div>
-                        <div class="detail-line" title="${escapeHtml(tokenTitle(p))}"><strong>Tokens:</strong> ${formatCompactNumber(p.tokens)} ${tokenDetailText(p, true) ? `(${escapeHtml(tokenDetailText(p, true))})` : ''}</div>
+                        <div class="detail-line" title="${escapeHtml(tokenTitle(p))}"><strong>Tokens:</strong> ${formatTokenValue(p, 'tokens')} ${tokenDetailText(p, true) ? `(${escapeHtml(tokenDetailText(p, true))})` : ''}</div>
                         <div style="font-weight: 600; margin-bottom: 8px; color: var(--text-secondary)">Models:</div>
                         ${modelRows || '<div style="color: var(--text-secondary)">No model data</div>'}
                         ${toolRows ? `<div style="font-weight: 600; margin: 12px 0 8px 0; color: var(--text-secondary)">Tools:</div>${toolRows}` : ''}
@@ -517,7 +535,7 @@ function renderSessions() {
                 <td colspan="10" style="padding: 0">
                     <div class="model-tree">
                         <div class="detail-line"><strong>Path:</strong> ${escapeHtml(s.cwd)}</div>
-                        <div class="detail-line"><strong>Tokens:</strong> ${formatFullNumber(aggTokenCounts.tokens)} ${tokenDetailText(aggTokenCounts) ? `(${escapeHtml(tokenDetailText(aggTokenCounts))})` : ''}</div>
+                        <div class="detail-line"><strong>Tokens:</strong> ${formatTokenValue(aggTokenCounts, 'tokens', false)} ${tokenDetailText(aggTokenCounts) ? `(${escapeHtml(tokenDetailText(aggTokenCounts))})` : ''}</div>
         `;
 
         // Main session with buttons
@@ -532,7 +550,7 @@ function renderSessions() {
                 <span class="model-stat" style="color: var(--accent-yellow)">${s.tool_time_display || '0s'}</span>
                 <span class="model-stat" style="color: var(--accent-blue)">${(s.avg_tps || 0).toFixed(1)} tok/s</span>
                 <span class="model-stat">${formatFullNumber(s.messages)} msgs</span>
-                <span class="model-stat token-wide" title="${escapeHtml(tokenTitle(s))}">${formatFullNumber(s.tokens)} tok</span>
+                <span class="model-stat token-wide" title="${escapeHtml(tokenTitle(s))}">${formatTokenValue(s, 'tokens', false)} tok</span>
                 <span class="model-stat token-detail-wide">${escapeHtml(tokenDetailText(s))}</span>
                 <span class="model-stat cost">$${s.cost.toFixed(2)}</span>
                 <span style="margin-left: 8px">
@@ -563,7 +581,7 @@ function renderSessions() {
                     <span class="model-stat" style="color: var(--accent-yellow)">${sub.tool_time_display || '0s'}</span>
                     <span class="model-stat" style="color: var(--accent-blue)">${(sub.avg_tps || 0).toFixed(1)} tok/s</span>
                     <span class="model-stat">${formatFullNumber(sub.messages)} msgs</span>
-                    <span class="model-stat token-wide" title="${escapeHtml(tokenTitle(sub))}">${formatFullNumber(sub.tokens)} tok</span>
+                    <span class="model-stat token-wide" title="${escapeHtml(tokenTitle(sub))}">${formatTokenValue(sub, 'tokens', false)} tok</span>
                     <span class="model-stat token-detail-wide">${escapeHtml(tokenDetailText(sub))}</span>
                     <span class="model-stat cost">$${sub.cost.toFixed(2)}</span>
                     <span style="margin-left: 8px">
@@ -653,8 +671,8 @@ function updateSortIcons(tableId, sortState) {
 }
 
 // ── Models table sorting ──────────────────────────────────────────────
-const models = dashboardData.models || [];
-const totalCost = dashboardData.totalCost || 1;
+const allModels = dashboardData.models || [];
+let models = allModels;
 let modelSort = { field: 'cost', asc: false };
 
 function renderModels() {
@@ -683,7 +701,7 @@ function renderModels() {
             <tr>
                 <td><span class="model-tag ${modelClass}">${escapeHtml(m.name)}</span></td>
                 <td title="${formatFullNumber(m.messages)}">${formatCompactNumber(m.messages)}</td>
-                <td class="tokens" title="${escapeHtml(tokenTitle)}">${formatCompactNumber(m.tokens)}</td>
+                <td class="tokens" title="${escapeHtml(tokenTitle)}">${formatTokenValue(m, 'tokens')}</td>
                 <td class="tokens" title="${formatFullNumber(m.input_tokens)}">${formatCompactNumber(m.input_tokens)}</td>
                 <td class="tokens" title="${formatFullNumber(m.output_tokens)}">${formatCompactNumber(m.output_tokens)}</td>
                 <td class="tokens" title="${formatFullNumber(m.cache_read_tokens)}">${formatCompactNumber(m.cache_read_tokens)}</td>
@@ -703,8 +721,8 @@ function renderModels() {
 }
 
 // ── Tools table sorting ───────────────────────────────────────────────
-const tools = dashboardData.tools || [];
-const totalToolTime = dashboardData.totalToolTime || 1;
+const allTools = dashboardData.tools || [];
+let tools = allTools;
 let toolSort = { field: 'time', asc: false };
 
 function renderTools() {
@@ -730,6 +748,280 @@ function renderTools() {
         `;
     }).join('');
 }
+
+// ── Date filtering ───────────────────────────────────────────────────
+const FILTER_FIELDS = [
+    'messages', 'tokens', 'input_tokens', 'output_tokens',
+    'cache_read_tokens', 'cache_write_tokens', 'reasoning_tokens',
+];
+
+function emptyModel(name) {
+    return {
+        name, messages: 0, tokens: 0, input_tokens: 0, output_tokens: 0,
+        cache_read_tokens: 0, cache_write_tokens: 0, reasoning_tokens: 0,
+        tokens_estimated: false, cost: 0, llm_time: 0, avg_tps: 0,
+    };
+}
+
+function aggregateProject(name, agentCmd, sessionList) {
+    const result = {
+        name, agent_cmd: agentCmd, sessions: sessionList.length,
+        sessions_list: sessionList, tokens_estimated: false,
+        total_messages: 0, total_tokens: 0, total_input_tokens: 0,
+        total_output_tokens: 0, total_cache_read_tokens: 0,
+        total_cache_write_tokens: 0, total_reasoning_tokens: 0,
+        messages: 0, tokens: 0, input_tokens: 0, output_tokens: 0,
+        cache_read_tokens: 0, cache_write_tokens: 0, reasoning_tokens: 0,
+        cost: 0, llm_time: 0, tool_time: 0, avg_tps: 0,
+        models: [], tools: [], last_activity: '',
+        last_activity_display: 'N/A',
+    };
+    const modelMap = {};
+    const toolMap = {};
+    const records = sessionList.flatMap(s => [s, ...(s.subagent_sessions || [])]);
+
+    records.forEach(s => {
+        result.messages += Number(s.messages || 0);
+        result.tokens += Number(s.tokens || 0);
+        result.input_tokens += Number(s.input_tokens || 0);
+        result.output_tokens += Number(s.output_tokens || 0);
+        result.cache_read_tokens += Number(s.cache_read_tokens || 0);
+        result.cache_write_tokens += Number(s.cache_write_tokens || 0);
+        result.reasoning_tokens += Number(s.reasoning_tokens || 0);
+        result.cost += Number(s.cost || 0);
+        result.llm_time += Number(s.llm_time || 0);
+        result.tool_time += Number(s.tool_time || 0);
+        result.tokens_estimated ||= Boolean(s.tokens_estimated);
+        if (s.end && (!result.last_activity || new Date(s.end) > new Date(result.last_activity))) {
+            result.last_activity = s.end;
+            result.last_activity_display = s.end_display || new Date(s.end).toISOString().slice(0, 16).replace('T', ' ');
+        }
+
+        Object.entries(s.models || {}).forEach(([modelName, source]) => {
+            const target = modelMap[modelName] || (modelMap[modelName] = emptyModel(modelName));
+            FILTER_FIELDS.forEach(field => {
+                if (field === 'messages') target.messages += Number(source.messages || 0);
+                else target[field] += Number(source[field] || 0);
+            });
+            target.cost += Number(source.cost || 0);
+            target.llm_time += Number(source.llm_time || 0);
+            target.tokens_estimated ||= Boolean(source.tokens_estimated);
+        });
+
+        Object.entries(s.tools || {}).forEach(([toolName, source]) => {
+            const target = toolMap[toolName] || (toolMap[toolName] = {
+                name: toolName, calls: 0, time: 0, errors: 0,
+            });
+            target.calls += Number(source.calls || 0);
+            target.time += Number(source.time || 0);
+            target.errors += Number(source.errors || 0);
+        });
+    });
+
+    result.models = Object.values(modelMap).map(m => ({
+        ...m,
+        avg_tps: m.llm_time > 0 ? m.output_tokens / m.llm_time : 0,
+    })).sort((a, b) => b.cost - a.cost);
+    result.tools = Object.values(toolMap).map(t => ({
+        ...t,
+        time_display: formatDuration(t.time),
+        avg_time: t.calls > 0 ? t.time / t.calls : 0,
+        avg_time_display: t.calls > 0 ? formatDuration(t.time / t.calls) : '0s',
+    })).sort((a, b) => b.time - a.time);
+    result.avg_tps = result.llm_time > 0 ? result.output_tokens / result.llm_time : 0;
+    // Display fields consumed by the existing project table renderer.
+    result.llm_time_display = formatDuration(result.llm_time);
+    result.tool_time_display = formatDuration(result.tool_time);
+    return result;
+}
+
+function aggregateGlobal(projectList) {
+    const global = {
+        total_cost: 0, total_tokens: 0, total_input_tokens: 0,
+        total_output_tokens: 0, total_cache_read_tokens: 0,
+        total_cache_write_tokens: 0, total_reasoning_tokens: 0,
+        total_messages: 0, total_sessions: 0, total_projects: projectList.length,
+        total_llm_time: 0, total_tool_time: 0, tokens_estimated: false,
+        models: {}, tools: {},
+    };
+    projectList.forEach(p => {
+        global.total_cost += p.cost;
+        global.total_tokens += p.tokens;
+        global.total_input_tokens += p.input_tokens;
+        global.total_output_tokens += p.output_tokens;
+        global.total_cache_read_tokens += p.cache_read_tokens;
+        global.total_cache_write_tokens += p.cache_write_tokens;
+        global.total_reasoning_tokens += p.reasoning_tokens;
+        global.total_messages += p.messages;
+        global.total_sessions += p.sessions;
+        global.total_llm_time += p.llm_time;
+        global.total_tool_time += p.tool_time;
+        global.tokens_estimated ||= Boolean(p.tokens_estimated);
+        p.models.forEach(source => {
+            const target = global.models[source.name] || (global.models[source.name] = emptyModel(source.name));
+            FILTER_FIELDS.forEach(field => {
+                if (field === 'messages') target.messages += Number(source.messages || 0);
+                else target[field] += Number(source[field] || 0);
+            });
+            target.cost += Number(source.cost || 0);
+            target.llm_time += Number(source.llm_time || 0);
+            target.tokens_estimated ||= Boolean(source.tokens_estimated);
+        });
+        p.tools.forEach(source => {
+            const target = global.tools[source.name] || (global.tools[source.name] = {name: source.name, calls: 0, time: 0, errors: 0});
+            target.calls += source.calls;
+            target.time += source.time;
+            target.errors += source.errors;
+        });
+    });
+    global.models = Object.values(global.models).map(m => ({
+        ...m, avg_tps: m.llm_time > 0 ? m.output_tokens / m.llm_time : 0,
+        pct: global.total_cost > 0 ? m.cost / global.total_cost * 100 : 0,
+    }));
+    global.tools = Object.values(global.tools).map(t => ({
+        ...t, time_display: formatDuration(t.time),
+        avg_time: t.calls > 0 ? t.time / t.calls : 0,
+        avg_time_display: t.calls > 0 ? formatDuration(t.time / t.calls) : '0s',
+        pct: global.total_tool_time > 0 ? t.time / global.total_tool_time * 100 : 0,
+    }));
+    global.avg_tps = global.total_llm_time > 0 ? global.total_output_tokens / global.total_llm_time : 0;
+    return global;
+}
+
+function sessionIsInRange(session, start, end) {
+    const sessionStart = session.start ? new Date(session.start).getTime() : null;
+    const sessionEnd = session.end ? new Date(session.end).getTime() : sessionStart;
+    const from = sessionStart ?? sessionEnd;
+    const to = sessionEnd ?? sessionStart;
+    if (from === null || to === null) return !start && !end;
+    // Include sessions that overlap the selected window, not only sessions
+    // whose start happened to fall inside it.
+    return (!start || to >= start) && (!end || from <= end);
+}
+
+function applyDateRange(start, end, label) {
+    if (start && end && start > end) {
+        window.alert('The start date must be before the end date.');
+        return;
+    }
+    projects = allProjects.map(p => {
+        const sessions = p.sessions_list
+            .filter(s => sessionIsInRange(s, start, end))
+            .map(s => ({
+                ...s,
+                subagent_sessions: (s.subagent_sessions || []).filter(sub => sessionIsInRange(sub, start, end)),
+            }));
+        return sessions.length ? aggregateProject(p.name, p.agent_cmd, sessions) : null;
+    }).filter(Boolean);
+    const global = aggregateGlobal(projects);
+    models = global.models;
+    tools = global.tools;
+    models.forEach(m => { m.pct = global.total_cost > 0 ? m.cost / global.total_cost * 100 : 0; });
+    projects.forEach(p => {
+        p.total_cost = p.cost;
+        p.total_messages = p.messages;
+        p.total_tokens = p.tokens;
+        p.total_input_tokens = p.input_tokens;
+        p.total_output_tokens = p.output_tokens;
+        p.total_cache_read_tokens = p.cache_read_tokens;
+        p.total_cache_write_tokens = p.cache_write_tokens;
+        p.total_reasoning_tokens = p.reasoning_tokens;
+    });
+
+    let filteredDays = dashboardData.dailyStats || [];
+    if (start || end) {
+        const dailyMap = {};
+        projects.forEach(p => p.sessions_list.flatMap(s => [s, ...(s.subagent_sessions || [])]).forEach(s => {
+            const activity = s.start || s.end;
+            if (!activity) return;
+            const day = activity.slice(0, 10);
+            const entry = dailyMap[day] || (dailyMap[day] = {day, cost: 0, models: {}});
+            entry.cost += Number(s.cost || 0);
+            Object.entries(s.models || {}).forEach(([model, stats]) => {
+                entry.models[model] = (entry.models[model] || 0) + Number(stats.cost || 0);
+            });
+        }));
+        filteredDays = Object.values(dailyMap).sort((a, b) => a.day.localeCompare(b.day));
+    }
+    window.setDailyStats(filteredDays);
+    updateSummary(global);
+    document.getElementById('date-filter-summary').textContent = label;
+    renderProjects();
+    renderSessions();
+    renderModels();
+    renderTools();
+}
+
+function updateSummary(global) {
+    const set = (id, value) => { const el = document.getElementById(id); if (el) el.textContent = value; };
+    set('summary-total-cost', `$${global.total_cost.toFixed(2)}`);
+    set('summary-projects', global.total_projects);
+    set('summary-sessions', global.total_sessions);
+    set('summary-messages', formatCompactNumber(global.total_messages));
+    set('summary-llm-time', formatDuration(global.total_llm_time));
+    set('summary-tool-time', formatDuration(global.total_tool_time));
+    set('summary-avg-tps', global.avg_tps.toFixed(1));
+    set('summary-total-tokens', `${global.tokens_estimated ? '~' : ''}${formatCompactNumber(global.total_tokens)}`);
+    set('projects-count', `${global.total_projects} projects`);
+    set('sessions-count', `${global.total_sessions} sessions`);
+    const label = document.querySelector('.token-card .label');
+    if (label) label.textContent = `Total Tokens${global.tokens_estimated ? ' (some estimated)' : ''}`;
+    const tokenValues = {
+        input: global.total_input_tokens, output: global.total_output_tokens,
+        'cache-read': global.total_cache_read_tokens, 'cache-write': global.total_cache_write_tokens,
+        reasoning: global.total_reasoning_tokens,
+    };
+    Object.entries(tokenValues).forEach(([key, value]) => set(`summary-token-${key}`, `${global.tokens_estimated ? '~' : ''}${formatCompactNumber(value)}`));
+}
+
+function localDateTimeValue(date) {
+    const pad = value => String(value).padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function setPreset(hours, days, label) {
+    const isAllTime = !hours && !days;
+    const end = isAllTime ? null : Date.now();
+    const start = hours ? end - hours * 3600000 : days ? end - days * 86400000 : null;
+    document.getElementById('date-filter-start').value = start ? localDateTimeValue(new Date(start)) : '';
+    document.getElementById('date-filter-end').value = end ? localDateTimeValue(new Date(end)) : '';
+    document.querySelectorAll('.filter-btn[data-hours], .filter-btn[data-days]').forEach(btn => {
+        const active = isAllTime
+            ? btn.dataset.hours === 'all'
+            : btn.dataset.hours === String(hours ?? 'none') && btn.dataset.days === String(days ?? 'none');
+        btn.classList.toggle('active', active);
+    });
+    applyDateRange(start, end, label);
+}
+
+function applyCustomDateRange() {
+    const startValue = document.getElementById('date-filter-start').value;
+    const endValue = document.getElementById('date-filter-end').value;
+    const start = startValue ? new Date(startValue).getTime() : null;
+    const end = endValue ? new Date(endValue).getTime() : null;
+    if ((startValue && !Number.isFinite(start)) || (endValue && !Number.isFinite(end))) {
+        window.alert('Please enter valid dates.');
+        return;
+    }
+    document.querySelectorAll('.filter-presets .filter-btn').forEach(btn => btn.classList.remove('active'));
+    const label = startValue || endValue
+        ? `${startValue || 'Beginning'} → ${endValue || 'Now'}`
+        : 'All time';
+    applyDateRange(start, end, label);
+}
+
+function clearDateFilter() {
+    setPreset(null, null, 'All time');
+}
+
+document.querySelectorAll('.filter-presets .filter-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+        if (btn.dataset.hours === 'all') setPreset(null, null, 'All time');
+        else setPreset(btn.dataset.hours ? Number(btn.dataset.hours) : null, btn.dataset.days ? Number(btn.dataset.days) : null, btn.textContent);
+    });
+});
+document.getElementById('apply-date-filter').addEventListener('click', applyCustomDateRange);
+document.getElementById('clear-date-filter').addEventListener('click', clearDateFilter);
 
 // Setup
 setupSorting('projects-table', projectSort, renderProjects);

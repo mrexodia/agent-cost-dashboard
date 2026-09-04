@@ -9,7 +9,7 @@ import urllib.parse
 import uuid
 from pathlib import Path
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 import html
 import http.server
 import socketserver
@@ -24,6 +24,7 @@ from typing import TypedDict, DefaultDict
 class ModelStats(TypedDict):
     messages: int
     tokens: int
+    tokens_estimated: bool
     input_tokens: int
     output_tokens: int
     cache_read_tokens: int
@@ -49,6 +50,7 @@ class DailyStats(TypedDict):
 
 class SessionStats(TypedDict):
     messages: int
+    tokens_estimated: bool
     input_tokens: int
     output_tokens: int
     cache_read_tokens: int
@@ -70,6 +72,7 @@ class SessionStats(TypedDict):
 
 class ProjectStats(TypedDict):
     name: str
+    tokens_estimated: bool
     agent_cmd: str
     sessions: list["Session"]
     total_messages: int
@@ -91,6 +94,7 @@ class ProjectStats(TypedDict):
 
 
 class GlobalStats(TypedDict):
+    tokens_estimated: bool
     total_cost: float
     total_tokens: int
     total_input_tokens: int
@@ -120,6 +124,7 @@ class Session(TypedDict):
     agent_cmd: str
     messages: int
     tokens: int
+    tokens_estimated: bool
     input_tokens: int
     output_tokens: int
     cache_read_tokens: int
@@ -132,6 +137,7 @@ class Session(TypedDict):
     llm_time: float
     tool_time: float
     tools: dict[str, ToolStats]
+    models: dict[str, ModelStats]
     avg_tps: float
     subagent_sessions: list["Session"]
 
@@ -141,6 +147,7 @@ def create_model_stats() -> ModelStats:
     return {
         "messages": 0,
         "tokens": 0,
+        "tokens_estimated": False,
         "input_tokens": 0,
         "output_tokens": 0,
         "cache_read_tokens": 0,
@@ -159,9 +166,10 @@ def create_daily_stats() -> DailyStats:
     return {"messages": 0, "cost": 0.0, "models": {}}
 
 
-# Session directories for different agents: (path, agent_command, source_type)
+# Fallback / non-discovered session directory sources:
+# (path, agent_command, source_type)
 # source_type: "standard" (pi/omp), "claude" (~/.claude/projects), "codex" (~/.codex/sessions)
-SESSIONS_DIRS = [
+_BASE_SESSIONS_DIRS: list[tuple[Path, str, str]] = [
     (Path.home() / ".pi" / "agent" / "sessions", "pi", "standard"),
     (Path.home() / "agentbox" / "config" / ".pi" / "agent" / "sessions", "pi", "standard"),
     (Path.home() / ".omp" / "agent" / "sessions", "omp", "standard"),
@@ -169,6 +177,35 @@ SESSIONS_DIRS = [
     (Path.home() / ".codex" / "sessions", "codex", "codex"),
     (Path.home() / ".gemini" / "tmp", "gemini-cli", "gemini"),
 ]
+
+
+def get_sessions_dirs() -> list[tuple[Path, str, str]]:
+    """Return every configured session source directory.
+
+    Discovers non-default pi agent directories under ~/.pi (e.g.
+    ~/.pi/agent-ollama/sessions) so they are included alongside the default
+    ~/.pi/agent/sessions.  Other agents (agentbox, omp, claude, codex, gemini)
+    are kept as static fallbacks and deduplicated against discovered paths.
+    """
+    discovered: dict[Path, tuple[Path, str, str]] = {}
+    pi_base = Path.home() / ".pi"
+    try:
+        profile_dirs = sorted(pi_base.iterdir()) if pi_base.is_dir() else []
+    except OSError:
+        profile_dirs = []
+    for subdir in profile_dirs:
+        sessions_dir = subdir / "sessions"
+        if sessions_dir.is_dir():
+            key = sessions_dir.resolve()
+            discovered[key] = (sessions_dir, "pi", "standard")
+
+    for entry in _BASE_SESSIONS_DIRS:
+        key = entry[0].resolve()
+        discovered.setdefault(key, entry)
+
+    return list(discovered.values())
+
+
 TEMP_DIR = Path(tempfile.gettempdir()) / "pi-dashboard"
 ASSETS_DIR = Path(__file__).parent / "assets"
 
@@ -558,12 +595,17 @@ def get_manual_cost(
 
 
 def parse_timestamp(ts):
-    """Parse ISO timestamp string to datetime."""
-    if not ts:
+    """Parse ISO or Unix (milliseconds) timestamps to datetime."""
+    if ts is None or ts == "":
         return None
     try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except (ValueError, TypeError):
+        if isinstance(ts, (int, float)):
+            # Pi stores message timestamps as Unix milliseconds.
+            seconds = ts / 1000 if abs(ts) >= 100_000_000_000 else ts
+            return datetime.fromtimestamp(seconds, tz=timezone.utc)
+        parsed = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
+    except (ValueError, TypeError, OverflowError, OSError):
         return None
 
 
@@ -627,13 +669,13 @@ def render_token_summary_card(global_stats: GlobalStats) -> str:
         ("Reasoning", global_stats["total_reasoning_tokens"]),
     ]
     rows = "".join(
-        f'<div><span>{label}</span><strong title="{format_full_number(count)}">{format_tokens(count)}</strong></div>'
+        f'<div><span>{label}</span><strong id="summary-token-{label.lower().replace(" ", "-")}" title="{format_full_number(count)}">{format_tokens(count)}</strong></div>'
         for label, count in items
     )
     return f"""
-            <div class="stat-card token-card">
-                <div class="label">Total Tokens</div>
-                <div class="value">{format_tokens(global_stats["total_tokens"])}</div>
+            <div class="stat-card token-card" title="A ~ prefix means the provider did not report usage and the value is estimated from the saved transcript.">
+                <div class="label">Total Tokens{" (some estimated)" if global_stats["tokens_estimated"] else ""}</div>
+                <div class="value" id="summary-total-tokens">{"~" if global_stats["tokens_estimated"] else ""}{format_tokens(global_stats["total_tokens"])}</div>
                 <div class="token-breakdown">{rows}</div>
             </div>"""
 
@@ -677,6 +719,7 @@ def create_session_stats() -> SessionStats:
     """Create a zeroed stats record for one session file."""
     return {
         "messages": 0,
+        "tokens_estimated": False,
         "input_tokens": 0,
         "output_tokens": 0,
         "cache_read_tokens": 0,
@@ -719,6 +762,7 @@ def record_llm_usage(
     cost: float = 0.0,
     ts: datetime | None = None,
     llm_delta: float = 0.0,
+    estimated_tokens: bool = False,
 ) -> None:
     """Record one LLM usage event into session and per-model stats."""
     total = (
@@ -729,6 +773,7 @@ def record_llm_usage(
     model_name = model or "unknown"
 
     stats["messages"] += 1
+    stats["tokens_estimated"] |= estimated_tokens
     stats["input_tokens"] += input_tokens
     stats["output_tokens"] += output_tokens
     stats["cache_read_tokens"] += cache_read_tokens
@@ -739,6 +784,7 @@ def record_llm_usage(
 
     mstats = stats["models"][model_name]
     mstats["messages"] += 1
+    mstats["tokens_estimated"] |= estimated_tokens
     mstats["tokens"] += total
     mstats["input_tokens"] += input_tokens
     mstats["output_tokens"] += output_tokens
@@ -761,6 +807,7 @@ def create_project_stats(name: str, agent_cmd: str) -> ProjectStats:
     """Create a zeroed project aggregate."""
     return {
         "name": name,
+        "tokens_estimated": False,
         "agent_cmd": agent_cmd,
         "sessions": [],
         "total_messages": 0,
@@ -801,6 +848,7 @@ def build_session_record(
         agent_cmd=agent_cmd,
         messages=stats["messages"],
         tokens=stats["total_tokens"],
+        tokens_estimated=stats["tokens_estimated"],
         input_tokens=stats["input_tokens"],
         output_tokens=stats["output_tokens"],
         cache_read_tokens=stats["cache_read_tokens"],
@@ -813,6 +861,7 @@ def build_session_record(
         llm_time=stats["llm_time"],
         tool_time=stats["tool_time"],
         tools=dict(stats["tools"]),
+        models={name: dict(values) for name, values in stats["models"].items()},
         avg_tps=calc_avg_tokens_per_sec(stats["tps_samples"]),
         subagent_sessions=subagent_sessions or [],
     )
@@ -823,6 +872,7 @@ def merge_model_stats(
 ) -> None:
     for model, source_stats in source.items():
         target_stats = target[model]
+        target_stats["tokens_estimated"] |= source_stats.get("tokens_estimated", False)
         for field in MODEL_STAT_FIELDS:
             target_stats[field] += source_stats.get(field, 0)
 
@@ -837,10 +887,51 @@ def merge_tool_stats(
         target_stats["errors"] += source_stats["errors"]
 
 
+def merge_project_stats(target: ProjectStats, source: ProjectStats) -> None:
+    """Merge a second project aggregate into the first (by reference)."""
+    target["sessions"].extend(source["sessions"])
+    target["tokens_estimated"] |= source["tokens_estimated"]
+    target["total_messages"] += source["total_messages"]
+    target["total_tokens"] += source["total_tokens"]
+    target["total_input_tokens"] += source["total_input_tokens"]
+    target["total_output_tokens"] += source["total_output_tokens"]
+    target["total_cache_read_tokens"] += source["total_cache_read_tokens"]
+    target["total_cache_write_tokens"] += source["total_cache_write_tokens"]
+    target["total_reasoning_tokens"] += source["total_reasoning_tokens"]
+    target["total_cost"] += source["total_cost"]
+    target["total_llm_time"] += source["total_llm_time"]
+    target["total_tool_time"] += source["total_tool_time"]
+    target["tps_samples"].extend(source["tps_samples"])
+
+    merge_model_stats(target["models"], source["models"])
+    merge_tool_stats(target["tools"], source["tools"])
+
+    for day, dstats in source["daily_stats"].items():
+        td = target["daily_stats"][day]
+        td["messages"] += dstats["messages"]
+        td["cost"] += dstats["cost"]
+        for mdl, mcost in dstats.get("models", {}).items():
+            td["models"][mdl] = td["models"].get(mdl, 0.0) + mcost
+
+    if source["first_activity"]:
+        if (
+            target["first_activity"] is None
+            or source["first_activity"] < target["first_activity"]
+        ):
+            target["first_activity"] = source["first_activity"]
+    if source["last_activity"]:
+        if (
+            target["last_activity"] is None
+            or source["last_activity"] > target["last_activity"]
+        ):
+            target["last_activity"] = source["last_activity"]
+
+
 def accumulate_session_into_project(
     project_stats: ProjectStats, stats: SessionStats
 ) -> None:
     """Add a parsed session (or subagent session) to a project aggregate."""
+    project_stats["tokens_estimated"] |= stats["tokens_estimated"]
     project_stats["total_messages"] += stats["messages"]
     project_stats["total_tokens"] += stats["total_tokens"]
     project_stats["total_input_tokens"] += stats["input_tokens"]
@@ -924,13 +1015,122 @@ def get_project_path_from_jsonl(project_dir, source_type: str = "standard"):
     return project_dir.name
 
 
+def _content_text(content) -> str:
+    """Extract user-visible/generated text from Pi message content.
+
+    Local providers commonly persist a zeroed ``usage`` object.  Keeping the
+    extraction here deliberately provider-agnostic lets the fallback below
+    estimate tokens without depending on a tokenizer package.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(_content_text(item) for item in content)
+    if isinstance(content, dict):
+        kind = content.get("type")
+        if kind in ("text", "thinking"):
+            return str(content.get(kind, ""))
+        if kind == "toolCall":
+            arguments = content.get("arguments", "")
+            try:
+                arguments = json.dumps(arguments, ensure_ascii=False)
+            except (TypeError, ValueError):
+                arguments = str(arguments)
+            return f'{content.get("name", "")} {arguments}'
+        if kind in ("toolResult", "tool_result"):
+            return _content_text(content.get("content", ""))
+        # User/tool content in older Pi versions may omit a type field.
+        return " ".join(
+            _content_text(value)
+            for key, value in content.items()
+            if key in ("text", "thinking", "content", "output", "result")
+        )
+    return ""
+
+
+def _estimate_tokens(text: str) -> int:
+    """Estimate tokens for providers that persist no usage information.
+
+    This is intentionally a conservative, transparent approximation (four
+    characters per token), not a claim about a provider tokenizer.
+    """
+    return (len(text) + 3) // 4 if text else 0
+
+
+def _usage_number(usage: dict, *names: str) -> int:
+    """Read a numeric usage field, accepting Pi and common API spellings."""
+    for name in names:
+        value = usage.get(name)
+        if value is not None:
+            try:
+                return max(0, int(value))
+            except (TypeError, ValueError):
+                continue
+    return 0
+
+
+def _usage_counts(usage: dict) -> tuple[int, int, int, int, int, int]:
+    """Normalize Pi/OpenAI/Anthropic usage shapes to dashboard counters."""
+    input_tokens = _usage_number(
+        usage,
+        "input",
+        "inputTokens",
+        "input_tokens",
+        "prompt_tokens",
+        "promptTokenCount",
+    )
+    output_tokens = _usage_number(
+        usage,
+        "output",
+        "outputTokens",
+        "output_tokens",
+        "completion_tokens",
+        "candidatesTokenCount",
+    )
+    cache_read = _usage_number(
+        usage,
+        "cacheRead", "cache_read", "cacheReadTokens", "cache_read_input_tokens",
+        "cached_tokens", "cachedContentTokenCount",
+    )
+    cache_write = _usage_number(
+        usage,
+        "cacheWrite", "cache_write", "cacheWriteTokens", "cache_creation_input_tokens",
+    )
+    reasoning = _usage_number(
+        usage, "reasoning", "reasoningTokens", "reasoning_tokens"
+    )
+    total = _usage_number(usage, "totalTokens", "total_tokens", "totalTokenCount")
+    return input_tokens, output_tokens, cache_read, cache_write, reasoning, total
+
+
+def _has_reported_usage(filepath: Path) -> bool:
+    """Return whether a standard session contains any non-zero usage."""
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    data = json.loads(line)
+                    msg = data.get("message", {})
+                    usage = msg.get("usage") if isinstance(msg, dict) else None
+                    if isinstance(usage, dict) and any(_usage_counts(usage)):
+                        return True
+                except (json.JSONDecodeError, TypeError, AttributeError):
+                    continue
+    except OSError:
+        pass
+    return False
+
+
 def analyze_jsonl_file(filepath: Path) -> SessionStats:
     """Analyze a single JSONL file and return stats."""
     stats = create_session_stats()
+    has_reported_usage = _has_reported_usage(filepath)
 
     last_request_ts = None  # Timestamp of last user message or toolResult
     pending_tool_calls = {}  # tool_call_id -> {"name": str, "timestamp": datetime}
     cwd = ""
+    # Used only when a provider writes a zeroed/absent usage object.
+    transcript_parts: list[str] = []
 
     try:
         with open(filepath, "r", encoding="utf-8", errors="replace") as f:
@@ -945,7 +1145,10 @@ def analyze_jsonl_file(filepath: Path) -> SessionStats:
 
                     msg = data["message"]
                     ts = parse_timestamp(data.get("timestamp"))
+                    if ts is None:
+                        ts = parse_timestamp(msg.get("timestamp"))
                     role = msg.get("role")
+                    content_text = _content_text(msg.get("content", ""))
 
                     # Process assistant messages (with or without usage)
                     if role == "assistant":
@@ -959,45 +1162,79 @@ def analyze_jsonl_file(filepath: Path) -> SessionStats:
                                 llm_delta = 0  # Invalid, don't use for tokens/sec
                             last_request_ts = None
 
-                        # Process usage data if present
-                        if "usage" in msg:
-                            usage = msg["usage"]
-                            cost = usage.get("cost", {})
-                            model = msg.get("model", "unknown")
-
-                            input_tok = usage.get("input", 0)
-                            output_tok = usage.get("output", 0)
-                            cache_read_tok = usage.get("cacheRead", 0)
-                            cache_write_tok = usage.get("cacheWrite", 0)
-                            total_tok = usage.get("totalTokens") or (
+                        # Process usage data.  Some local Pi providers emit a
+                        # usage object with every counter set to zero (or omit
+                        # it altogether), so estimate transcript/output tokens
+                        # rather than silently displaying zero.
+                        usage = msg.get("usage")
+                        usage = usage if isinstance(usage, dict) else {}
+                        cost = usage.get("cost", {})
+                        cost = cost if isinstance(cost, dict) else {}
+                        model = msg.get("model", "unknown")
+                        (
+                            input_tok,
+                            output_tok,
+                            cache_read_tok,
+                            cache_write_tok,
+                            reasoning_tok,
+                            total_tok,
+                        ) = _usage_counts(usage)
+                        estimated_tokens = False
+                        if not has_reported_usage and not any(
+                            (
+                                input_tok,
+                                output_tok,
+                                cache_read_tok,
+                                cache_write_tok,
+                                reasoning_tok,
+                                total_tok,
+                            )
+                        ):
+                            # The full context sent to the provider is not
+                            # recoverable from Pi's log, but the prior
+                            # transcript is a useful lower-bound estimate.
+                            input_tok = _estimate_tokens(" ".join(transcript_parts))
+                            output_tok = _estimate_tokens(content_text)
+                            total_tok = input_tok + output_tok
+                            estimated_tokens = bool(total_tok)
+                        elif not total_tok:
+                            total_tok = (
                                 input_tok
                                 + output_tok
                                 + cache_read_tok
                                 + cache_write_tok
                             )
-                            reported_cost = cost.get("total", 0)
+                        try:
+                            reported_cost = float(cost.get("total", 0) or 0)
+                        except (TypeError, ValueError):
+                            reported_cost = 0.0
 
-                            if reported_cost == 0:
-                                reported_cost = get_manual_cost(
-                                    model,
-                                    input_tok,
-                                    output_tok,
-                                    cache_read_tok,
-                                    cache_write_tok,
-                                )
-
-                            record_llm_usage(
-                                stats,
+                        # Never turn a transcript approximation into a
+                        # fabricated spend figure.  Manual pricing is only
+                        # applied to provider-reported token counts.
+                        if reported_cost == 0 and not estimated_tokens:
+                            reported_cost = get_manual_cost(
                                 model,
                                 input_tok,
                                 output_tok,
                                 cache_read_tok,
                                 cache_write_tok,
-                                total_tokens=total_tok,
-                                cost=reported_cost,
-                                ts=ts,
-                                llm_delta=llm_delta,
                             )
+
+                        record_llm_usage(
+                            stats,
+                            model,
+                            input_tok,
+                            output_tok,
+                            cache_read_tok,
+                            cache_write_tok,
+                            reasoning_tokens=reasoning_tok,
+                            total_tokens=total_tok,
+                            cost=reported_cost,
+                            ts=ts,
+                            llm_delta=llm_delta,
+                            estimated_tokens=estimated_tokens,
+                        )
 
                         # Track tool calls from assistant messages
                         if ts:
@@ -1041,6 +1278,9 @@ def analyze_jsonl_file(filepath: Path) -> SessionStats:
                                     stats["tools"][tool_name]["time"] += tool_delta
                                     if is_error:
                                         stats["tools"][tool_name]["errors"] += 1
+
+                    if content_text:
+                        transcript_parts.append(content_text)
 
                 except json.JSONDecodeError:
                     continue
@@ -1553,9 +1793,18 @@ def analyze_session_file(filepath: Path, source_type: str) -> SessionStats:
 
 
 def analyze_project(
-    project_dir: Path, agent_cmd: str, source_type: str = "standard"
+    project_dir: Path,
+    agent_cmd: str,
+    source_type: str = "standard",
+    seen_session_ids: set[str] | None = None,
 ) -> ProjectStats | None:
-    """Analyze all sessions in a project directory."""
+    """Analyze all sessions in a project directory.
+
+    If ``seen_session_ids`` is provided, session files whose id has already
+    been processed are skipped.  This prevents backup/agent copies of the
+    same session from inflating totals when multiple session directories are
+    scanned.
+    """
 
     # Gemini sessions are in a 'chats' subdirectory within the project folder
     if source_type == "gemini" and project_dir.name != "chats":
@@ -1575,6 +1824,12 @@ def analyze_project(
         return None
 
     for filepath in sorted(jsonl_files):
+        session_uid = get_session_id_from_file(
+            str(filepath), source_type
+        ) or str(uuid.uuid4())
+        if seen_session_ids is not None and session_uid in seen_session_ids:
+            continue
+
         stats = analyze_session_file(filepath, source_type)
         if stats["messages"] == 0:
             continue
@@ -1594,6 +1849,12 @@ def analyze_project(
         if subagent_dir.exists() and subagent_dir.is_dir():
             # Find all JSONL files in the subagent directory
             for sub_jsonl in sorted(subagent_dir.rglob("*.jsonl")):
+                sub_uid = get_session_id_from_file(
+                    str(sub_jsonl), source_type
+                ) or str(uuid.uuid4())
+                if seen_session_ids is not None and sub_uid in seen_session_ids:
+                    continue
+
                 sub_stats = analyze_session_file(sub_jsonl, source_type)
                 if sub_stats["messages"] > 0:
                     sub_duration = (
@@ -1620,13 +1881,10 @@ def analyze_project(
                         sub_duration,
                     )
                     SESSION_REGISTRY[sub_uid] = sub_session
+                    if seen_session_ids is not None:
+                        seen_session_ids.add(sub_uid)
                     subagent_sessions.append(sub_session)
                     accumulate_session_into_project(project_stats, sub_stats)
-
-        # Get UID from file or generate random one
-        session_uid = get_session_id_from_file(str(filepath), source_type) or str(
-            uuid.uuid4()
-        )
 
         session = build_session_record(
             filepath,
@@ -1638,6 +1896,8 @@ def analyze_project(
             subagent_sessions,
         )
         SESSION_REGISTRY[session_uid] = session
+        if seen_session_ids is not None:
+            seen_session_ids.add(session_uid)
         project_stats["sessions"].append(session)
         accumulate_session_into_project(project_stats, stats)
 
@@ -1776,12 +2036,21 @@ def get_session_cwd(session_path: str, source_type: str = "standard") -> str:
 
 
 def _build_codex_project_stats(
-    project_cwd: str, files: list[Path], agent_cmd: str
+    project_cwd: str,
+    files: list[Path],
+    agent_cmd: str,
+    seen_session_ids: set[str] | None = None,
 ) -> ProjectStats | None:
     """Build a ProjectStats from a list of Codex session files grouped by cwd."""
     project_stats = create_project_stats(project_cwd, agent_cmd)
 
     for filepath in sorted(files):
+        session_uid = get_session_id_from_file(str(filepath), "codex") or str(
+            uuid.uuid4()
+        )
+        if seen_session_ids is not None and session_uid in seen_session_ids:
+            continue
+
         stats = analyze_codex_jsonl_file(filepath)
         if stats["messages"] == 0:
             continue
@@ -1790,10 +2059,6 @@ def _build_codex_project_stats(
             (stats["end"] - stats["start"]).total_seconds()
             if stats["start"] and stats["end"]
             else 0
-        )
-
-        session_uid = get_session_id_from_file(str(filepath), "codex") or str(
-            uuid.uuid4()
         )
 
         session = build_session_record(
@@ -1805,6 +2070,8 @@ def _build_codex_project_stats(
             duration,
         )
         SESSION_REGISTRY[session_uid] = session
+        if seen_session_ids is not None:
+            seen_session_ids.add(session_uid)
         project_stats["sessions"].append(session)
         accumulate_session_into_project(project_stats, stats)
 
@@ -1815,6 +2082,7 @@ def _accumulate_global_stats(
     global_stats: GlobalStats, project_stats: ProjectStats
 ) -> None:
     """Accumulate project stats into global stats."""
+    global_stats["tokens_estimated"] |= project_stats["tokens_estimated"]
     global_stats["total_cost"] += project_stats["total_cost"]
     global_stats["total_tokens"] += project_stats["total_tokens"]
     global_stats["total_input_tokens"] += project_stats["total_input_tokens"]
@@ -1848,8 +2116,13 @@ def collect_all_stats() -> tuple[list[ProjectStats], GlobalStats]:
     # Clear the session registry to avoid stale entries on reload
     clear_session_registry()
 
+    # Track session ids across all source directories so a session copied into
+    # multiple agent profiles (e.g. backups) is only counted once.
+    seen_session_ids: set[str] = set()
+
     all_projects: list[ProjectStats] = []
     global_stats: GlobalStats = {
+        "tokens_estimated": False,
         "total_cost": 0.0,
         "total_tokens": 0,
         "total_input_tokens": 0,
@@ -1868,7 +2141,7 @@ def collect_all_stats() -> tuple[list[ProjectStats], GlobalStats]:
         "tps_samples": [],
     }
 
-    for sessions_dir, agent_cmd, source_type in SESSIONS_DIRS:
+    for sessions_dir, agent_cmd, source_type in get_sessions_dirs():
         if not sessions_dir.exists():
             continue
 
@@ -1885,11 +2158,10 @@ def collect_all_stats() -> tuple[list[ProjectStats], GlobalStats]:
                 # Create a temporary directory-like structure for analyze
                 # by building ProjectStats directly
                 project_stats = _build_codex_project_stats(
-                    project_cwd, files, agent_cmd
+                    project_cwd, files, agent_cmd, seen_session_ids
                 )
                 if project_stats and project_stats["sessions"]:
                     all_projects.append(project_stats)
-                    _accumulate_global_stats(global_stats, project_stats)
             continue
 
         # Standard, Claude, Gemini: iterate per-project subdirectories
@@ -1897,11 +2169,27 @@ def collect_all_stats() -> tuple[list[ProjectStats], GlobalStats]:
             if not project_dir.is_dir() or project_dir.name.startswith("."):
                 continue
 
-            project_stats = analyze_project(project_dir, agent_cmd, source_type)
+            project_stats = analyze_project(
+                project_dir, agent_cmd, source_type, seen_session_ids
+            )
 
             if project_stats:
                 all_projects.append(project_stats)
-                _accumulate_global_stats(global_stats, project_stats)
+
+    # Merge project aggregates that share the same project name so the same
+    # workspace appearing in multiple agent directories shows a single row.
+    merged_by_name: dict[str, ProjectStats] = {}
+    for project_stats in all_projects:
+        name = project_stats["name"]
+        if name in merged_by_name:
+            merge_project_stats(merged_by_name[name], project_stats)
+        else:
+            merged_by_name[name] = project_stats
+    all_projects = list(merged_by_name.values())
+
+    # Roll up projects into global totals once they are fully merged.
+    for project_stats in all_projects:
+        _accumulate_global_stats(global_stats, project_stats)
 
     return all_projects, global_stats
 
@@ -1939,6 +2227,7 @@ def generate_html():
                         "cwd": sub["cwd"],
                         "messages": sub["messages"],
                         "tokens": sub["tokens"],
+                        "tokens_estimated": sub["tokens_estimated"],
                         "input_tokens": sub["input_tokens"],
                         "output_tokens": sub["output_tokens"],
                         "cache_read_tokens": sub["cache_read_tokens"],
@@ -1956,6 +2245,8 @@ def generate_html():
                         "llm_time_display": format_duration(sub_llm),
                         "tool_time": sub_tool,
                         "tool_time_display": format_duration(sub_tool),
+                        "models": sub["models"],
+                        "tools": sub["tools"],
                         "avg_tps": sub_tps,
                     }
                 )
@@ -1971,6 +2262,7 @@ def generate_html():
                     "cwd": s["cwd"],
                     "messages": s["messages"],
                     "tokens": s["tokens"],
+                    "tokens_estimated": s["tokens_estimated"],
                     "input_tokens": s["input_tokens"],
                     "output_tokens": s["output_tokens"],
                     "cache_read_tokens": s["cache_read_tokens"],
@@ -1988,6 +2280,8 @@ def generate_html():
                     "llm_time_display": format_duration(llm_secs),
                     "tool_time": tool_secs,
                     "tool_time_display": format_duration(tool_secs),
+                    "models": s["models"],
+                    "tools": s["tools"],
                     "avg_tps": session_tps,
                     "subagent_sessions": sub_sessions_json,
                 }
@@ -2007,6 +2301,7 @@ def generate_html():
                     "name": model_name,
                     "messages": mstats["messages"],
                     "tokens": mstats["tokens"],
+                    "tokens_estimated": mstats["tokens_estimated"],
                     "input_tokens": mstats["input_tokens"],
                     "output_tokens": mstats["output_tokens"],
                     "cache_read_tokens": mstats["cache_read_tokens"],
@@ -2049,6 +2344,7 @@ def generate_html():
                 "sessions_list": sessions_json,
                 "messages": p["total_messages"],
                 "tokens": p["total_tokens"],
+                "tokens_estimated": p["tokens_estimated"],
                 "input_tokens": p["total_input_tokens"],
                 "output_tokens": p["total_output_tokens"],
                 "cache_read_tokens": p["total_cache_read_tokens"],
@@ -2098,6 +2394,7 @@ def generate_html():
                 "name": model_name,
                 "messages": mstats["messages"],
                 "tokens": mstats["tokens"],
+                "tokens_estimated": mstats["tokens_estimated"],
                 "input_tokens": mstats.get("input_tokens", 0),
                 "output_tokens": mstats.get("output_tokens", 0),
                 "cache_read_tokens": mstats.get("cache_read_tokens", 0),
@@ -2142,6 +2439,7 @@ def generate_html():
             "models": models_json,
             "tools": tools_json,
             "totalCost": global_stats["total_cost"],
+            "tokensEstimated": global_stats["tokens_estimated"],
             "totalToolTime": global_stats["total_tool_time"],
         }
     )
@@ -2165,32 +2463,58 @@ def generate_html():
         <div class="stats-grid">
             <div class="stat-card">
                 <div class="label">Total Cost</div>
-                <div class="value cost">${global_stats["total_cost"]:.2f}</div>
+                <div class="value cost" id="summary-total-cost">${global_stats["total_cost"]:.2f}</div>
             </div>
             <div class="stat-card">
                 <div class="label">Projects</div>
-                <div class="value">{global_stats["total_projects"]}</div>
+                <div class="value" id="summary-projects">{global_stats["total_projects"]}</div>
             </div>
             <div class="stat-card">
                 <div class="label">Sessions</div>
-                <div class="value">{global_stats["total_sessions"]}</div>
+                <div class="value" id="summary-sessions">{global_stats["total_sessions"]}</div>
             </div>
             <div class="stat-card">
                 <div class="label">LLM Calls</div>
-                <div class="value" title="{format_full_number(global_stats["total_messages"])}">{format_tokens(global_stats["total_messages"])}</div>
+                <div class="value" id="summary-messages" title="{format_full_number(global_stats["total_messages"])}">{format_tokens(global_stats["total_messages"])}</div>
             </div>
             {token_summary_card}
             <div class="stat-card">
                 <div class="label">LLM Time</div>
-                <div class="value" style="color: var(--accent-purple)">{format_duration(global_stats["total_llm_time"])}</div>
+                <div class="value" id="summary-llm-time" style="color: var(--accent-purple)">{format_duration(global_stats["total_llm_time"])}</div>
             </div>
             <div class="stat-card">
                 <div class="label">Tool Time</div>
-                <div class="value" style="color: var(--accent-yellow)">{format_duration(global_stats["total_tool_time"])}</div>
+                <div class="value" id="summary-tool-time" style="color: var(--accent-yellow)">{format_duration(global_stats["total_tool_time"])}</div>
             </div>
             <div class="stat-card">
                 <div class="label">Avg Tokens/s</div>
-                <div class="value" style="color: var(--accent-blue)">{calc_avg_tokens_per_sec(global_stats["tps_samples"]):.1f}</div>
+                <div class="value" id="summary-avg-tps" style="color: var(--accent-blue)">{calc_avg_tokens_per_sec(global_stats["tps_samples"]):.1f}</div>
+            </div>
+        </div>
+
+        <div class="section date-filter-section">
+            <div class="section-header">
+                <span>Date filter</span>
+                <span class="badge" id="date-filter-summary">All time</span>
+            </div>
+            <div class="date-filter-controls">
+                <div class="filter-presets" aria-label="Date range presets">
+                    <button type="button" class="filter-btn active" data-hours="all">All time</button>
+                    <button type="button" class="filter-btn" data-hours="1">1h</button>
+                    <button type="button" class="filter-btn" data-hours="2">2h</button>
+                    <button type="button" class="filter-btn" data-hours="4">4h</button>
+                    <button type="button" class="filter-btn" data-hours="8">8h</button>
+                    <button type="button" class="filter-btn" data-hours="12">12h</button>
+                    <button type="button" class="filter-btn" data-hours="24">24h</button>
+                    <button type="button" class="filter-btn" data-days="7">7d</button>
+                </div>
+                <div class="custom-date-range">
+                    <label>From <input type="datetime-local" id="date-filter-start"></label>
+                    <label>To <input type="datetime-local" id="date-filter-end"></label>
+                    <button type="button" class="filter-btn" id="apply-date-filter">Apply</button>
+                    <button type="button" class="filter-btn" id="clear-date-filter">Clear</button>
+                </div>
+                <div class="filter-help">Filters dashboard totals, charts, projects, models, tools, and sessions by session activity.</div>
             </div>
         </div>
 
@@ -2249,7 +2573,7 @@ def generate_html():
         <div class="section">
             <div class="section-header">
                 <span>Projects</span>
-                <span class="badge">{len(all_projects)} projects</span>
+                <span class="badge" id="projects-count">{len(all_projects)} projects</span>
             </div>
             <table id="projects-table">
                 <thead>
@@ -2377,7 +2701,9 @@ def main():
     args = parser.parse_args()
 
     # Check if any sessions directory exists
-    any_exists = any(sessions_dir.exists() for sessions_dir, _, _ in SESSIONS_DIRS)
+    any_exists = any(
+        sessions_dir.exists() for sessions_dir, _, _ in get_sessions_dirs()
+    )
     if not any_exists:
         print("⚠️  No sessions directories found. No data to display yet.")
 
@@ -2394,7 +2720,7 @@ def main():
     print("🚀 Agent Cost Dashboard (pi, omp, claude, codex, gemini)")
     print(f"   Serving on: http://{args.host}:{args.port}")
     print("   Data from:")
-    for sessions_dir, agent_cmd, source_type in SESSIONS_DIRS:
+    for sessions_dir, agent_cmd, source_type in get_sessions_dirs():
         exists = "✓" if sessions_dir.exists() else "✗"
         print(f"     {exists} {sessions_dir} ({agent_cmd})")
     print("\n   Press Ctrl+C to stop\n")

@@ -120,6 +120,66 @@ h1 {
     min-width: 110px;
 }
 
+.date-filter-section {
+    overflow: visible;
+}
+
+.date-filter-controls {
+    padding: 14px 16px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px 18px;
+}
+
+.filter-presets,
+.custom-date-range {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+}
+
+.custom-date-range label {
+    color: var(--text-secondary);
+    font-size: 13px;
+}
+
+.custom-date-range input {
+    margin-left: 5px;
+    padding: 6px 8px;
+    color: var(--text-primary);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 5px;
+    font: inherit;
+    color-scheme: dark;
+}
+
+.filter-btn {
+    padding: 6px 11px;
+    color: var(--text-secondary);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 5px;
+    cursor: pointer;
+    font: inherit;
+    font-size: 13px;
+}
+
+.filter-btn:hover,
+.filter-btn.active {
+    color: var(--text-primary);
+    border-color: var(--accent-blue);
+    background: #1f6feb33;
+}
+
+.filter-help {
+    width: 100%;
+    color: var(--text-secondary);
+    font-size: 12px;
+}
+
 .section {
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
