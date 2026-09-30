@@ -1,6 +1,6 @@
 # Agent Cost Dashboard
 
-Web dashboard to monitor API costs for [Pi](https://github.com/mariozechner/pi-coding-agent), [Oh My Pi](https://github.com/can1357/oh-my-pi), [Claude Code](https://github.com/anthropics/claude-code), [Codex CLI](https://github.com/openai/codex), and [Gemini CLI](https://github.com/google-gemini/gemini-cli) coding agents.
+Web dashboard to monitor API costs for [Pi](https://github.com/mariozechner/pi-coding-agent), [Oh My Pi](https://github.com/can1357/oh-my-pi), [Claude Code](https://github.com/anthropics/claude-code), [Codex CLI](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), Antigravity, and [OpenCode](https://opencode.ai) coding agents.
 
 No external dependencies — pure Python stdlib.
 
@@ -43,7 +43,7 @@ All projects with expandable details:
 ### Session Browser
 Browse every session with full details:
 - Copy command to resume session to the clipboard
-- Full transcript export (Pi via `pi --export`, Claude and Codex via built-in exporters)
+- Full transcript export (Pi via `pi --export`; Claude, Codex, Gemini, Antigravity and OpenCode via built-in exporters)
 - Session duration, LLM time, and tool time
 - Subagent session support with expandable grouping
 - Sortable by date, duration, cost, tokens, and more
@@ -90,19 +90,24 @@ The dashboard automatically reads session data from:
 | Claude Code | `~/.claude/projects` |
 | Codex CLI | `~/.codex/sessions` |
 | Gemini CLI | `~/.gemini/tmp` |
+| Antigravity CLI (`agy`) | `~/.gemini/antigravity-cli/conversations` |
+| Antigravity IDE | `~/.gemini/antigravity/conversations` |
+| Antigravity | `~/.antigravity` |
+| OpenCode | `~/.local/share/opencode/opencode.db` |
 
 ## CLI Utilities
 
-### claude_cost.py / gemini_cost.py
+### claude_cost.py / gemini_cost.py / antigravity_cost.py
 
 Calculate API costs for agent sessions:
 
 ```bash
 python claude_cost.py /path/to/sessions
 python gemini_cost.py ~/.gemini/tmp/project/chats
+python antigravity_cost.py ~/.gemini/antigravity-cli
 ```
 
-### claude_export.py / codex_export.py / gemini_export.py
+### claude_export.py / codex_export.py / gemini_export.py / antigravity_export.py / opencode_export.py
 
 Export a session JSONL file to a styled HTML transcript:
 
@@ -110,11 +115,13 @@ Export a session JSONL file to a styled HTML transcript:
 python claude_export.py input.jsonl output.html
 python codex_export.py input.jsonl output.html
 python gemini_export.py input.jsonl output.html
+python antigravity_export.py input.db output.html
+python opencode_export.py ses_abc123 output.html
 ```
 
 ## Pricing
 
-Costs are calculated using pricing reported by the agent. For models that don't report costs (e.g., Gemini via Google Cloud), estimated pricing is applied based on public API rates. Supported model families: Claude, Gemini, GPT-5, O3/O4, GLM.
+Costs are calculated using pricing reported by the agent. For models that don't report costs (e.g., Gemini via Google Cloud, and OpenCode which always records zero), estimated pricing is applied based on public API rates. OpenCode runs a lot of local and free-tier models (LM Studio, Ollama, Lemonade, and the `*-free` Zen tiers), which correctly show no cost because there is none; refresh `models.json` with `python3 update_models.py` when a newly used model should be priced. Supported model families: Claude, Gemini (including the Antigravity 3.1–3.8 Flash/Pro tiers), GPT-OSS, GPT-5, O3/O4, GLM.
 
 ## Credits
 
