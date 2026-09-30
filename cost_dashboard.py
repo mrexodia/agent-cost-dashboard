@@ -2,22 +2,27 @@
 """Serve a dynamic HTML dashboard with cost statistics for all pi-agent sessions."""
 
 import json
+import os
 import re
 import subprocess
 import tempfile
 import urllib.parse
 import uuid
+from functools import lru_cache
 from pathlib import Path
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 import html
 import http.server
 import socketserver
 import argparse
 import shlex
 import shutil
+import sqlite3
 import sys
 from typing import TypedDict, DefaultDict
+
+from antigravity_cost import ANTIGRAVITY_MODEL_ID_MAP, decode_protobuf
 
 
 # Type definitions
@@ -160,7 +165,7 @@ def create_daily_stats() -> DailyStats:
 
 
 # Session directories for different agents: (path, agent_command, source_type)
-# source_type: "standard" (pi/omp), "claude" (~/.claude/projects), "codex" (~/.codex/sessions)
+# source_type: "standard" (pi/omp), "claude" (~/.claude/projects), "codex" (~/.codex/sessions), "antigravity"
 SESSIONS_DIRS = [
     (Path.home() / ".pi" / "agent" / "sessions", "pi", "standard"),
     (Path.home() / "agentbox" / "config" / ".pi" / "agent" / "sessions", "pi", "standard"),
@@ -168,6 +173,9 @@ SESSIONS_DIRS = [
     (Path.home() / ".claude" / "projects", "claude", "claude"),
     (Path.home() / ".codex" / "sessions", "codex", "codex"),
     (Path.home() / ".gemini" / "tmp", "gemini-cli", "gemini"),
+    (Path.home() / ".gemini" / "antigravity-cli", "agy", "antigravity"),
+    (Path.home() / ".gemini" / "antigravity", "agy", "antigravity"),
+    (Path.home() / ".antigravity", "agy", "antigravity"),
 ]
 TEMP_DIR = Path(tempfile.gettempdir()) / "pi-dashboard"
 ASSETS_DIR = Path(__file__).parent / "assets"
@@ -185,14 +193,14 @@ def clear_session_registry() -> None:
 def get_session_id_from_file(
     filepath: str, source_type: str = "standard"
 ) -> str | None:
-    """Extract session ID from a JSONL file.
+    """Extract session ID from a session file.
 
     For standard (pi/omp): read the ID from the session record. Newer OMP
     files may put an in-place title metadata record before it.
-    For claude: use the filename stem (UUID)
+    For claude / antigravity: use the filename stem (UUID)
     For codex: read session_meta.payload.id
     """
-    if source_type == "claude":
+    if source_type in ("claude", "antigravity"):
         return Path(filepath).stem
 
     try:
@@ -280,6 +288,53 @@ MANUAL_PRICING = {
         "output": 12.00,
         "cache_read": 0.20,
         "cache_write": 0.375,
+    },
+    # ── Gemini 3.1+ (Antigravity model tiers) ─────────────────────────────────
+    # Antigravity labels models as display names ("Gemini 3.1 Pro (High)"), which
+    # the antigravity analyzer normalizes to hyphens before pricing, so these
+    # hyphenated patterns match every tier suffix (Low/Medium/High/Thinking).
+    "gemini-3.1-flash-lite": {
+        "input": 0.25,
+        "output": 1.50,
+        "cache_read": 0.025,
+        "cache_write": 0.083,
+    },
+    "gemini-3.1-flash": {
+        "input": 0.50,
+        "output": 3.00,
+        "cache_read": 0.05,
+        "cache_write": 0.083,
+    },
+    "gemini-3.1-pro": {
+        "input": 2.00,
+        "output": 12.00,
+        "cache_read": 0.20,
+        "cache_write": 0.375,
+    },
+    # Gemini 3.5–3.8 Flash all bill at the $0.50/$3.00 Flash tier.
+    "gemini-3.5-flash": {
+        "input": 0.50,
+        "output": 3.00,
+        "cache_read": 0.05,
+        "cache_write": 0.083,
+    },
+    "gemini-3.6-flash": {
+        "input": 0.50,
+        "output": 3.00,
+        "cache_read": 0.05,
+        "cache_write": 0.083,
+    },
+    "gemini-3.7-flash": {
+        "input": 0.50,
+        "output": 3.00,
+        "cache_read": 0.05,
+        "cache_write": 0.083,
+    },
+    "gemini-3.8-flash": {
+        "input": 0.50,
+        "output": 3.00,
+        "cache_read": 0.05,
+        "cache_write": 0.083,
     },
     # ── Claude (Anthropic API pricing per 1M tokens) ──────────────────────────
     # Specific version strings avoid mislabelling different-priced variants.
@@ -427,6 +482,12 @@ MANUAL_PRICING = {
         "input": 1.1,
         "output": 4.4,
         "cache_read": 0.275,
+    },
+    # gpt-oss-120b — Antigravity's open-weight tier; served at a local rate.
+    "gpt-oss-120b": {
+        "input": 0.15,
+        "output": 0.60,
+        "cache_read": 0.015,
     },
 }
 
@@ -1540,6 +1601,237 @@ def analyze_gemini_jsonl_file(filepath: Path) -> SessionStats:
     return stats
 
 
+# Antigravity (the `agy` CLI and the IDE extension) stores each conversation as a
+# SQLite database rather than JSONL. Everything interesting lives in protobuf
+# blobs on the `steps` table:
+#   metadata.f1  google.protobuf.Timestamp — step start
+#   metadata.f8  google.protobuf.Timestamp — step end
+#   metadata.f4  tool call descriptor (f2 = tool name) on tool steps
+#   metadata.f9  token usage on LLM steps (field map below)
+#
+# The workspace directory lives in a step_payload submessage too, but which one
+# depends on the front-end; see _read_antigravity_cwd below.
+#
+# The usage message (metadata.f9) uses these field numbers:
+#   1 = model id, 2 = uncached input, 3 = total output, 5 = cache read,
+#   9 = reasoning, 10 = non-reasoning output
+# with the invariant output (3) == reasoning (9) + non-reasoning (10).
+#
+# Note the input (2) and cache read (5) counters are *disjoint* buckets, not a
+# total plus the cached part of it — across every recorded call the cached count
+# exceeds the input count in the large majority of turns, which would be
+# impossible if input included cache. So they are summed, never subtracted from
+# one another (unlike the Codex and Gemini analyzers above).
+ANTIGRAVITY_STEP_LLM = (15, 23)
+ANTIGRAVITY_STEP_TOOL = 132
+ANTIGRAVITY_STEP_ERROR = 7
+
+
+def _antigravity_field(blob: bytes, field_num: int) -> bytes | None:
+    """Return the raw bytes of a length-delimited protobuf field, or None."""
+    for fn, wire_type, value in decode_protobuf(blob):
+        if fn == field_num and wire_type == 2:
+            return value
+    return None
+
+
+def _antigravity_varints(blob: bytes) -> dict[int, int]:
+    """Collect a protobuf message's varint fields into a {field_num: value} map."""
+    return {fn: val for fn, wire_type, val in decode_protobuf(blob) if wire_type == 0}
+
+
+def _antigravity_string(blob: bytes, field_num: int) -> str:
+    """Return a protobuf string field decoded as UTF-8, or '' when absent."""
+    raw = _antigravity_field(blob, field_num)
+    if not raw:
+        return ""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return ""
+
+
+def _antigravity_timestamp(blob: bytes | None) -> datetime | None:
+    """Decode a google.protobuf.Timestamp ({1: seconds, 2: nanos}) to UTC."""
+    if not blob:
+        return None
+    parts = _antigravity_varints(blob)
+    seconds = parts.get(1)
+    if not seconds:
+        return None
+    try:
+        return datetime.fromtimestamp(
+            seconds + parts.get(2, 0) / 1_000_000_000, tz=timezone.utc
+        )
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def get_antigravity_cost(
+    model_label: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int,
+) -> float:
+    """Price an Antigravity model label such as 'Gemini 3.1 Pro (High)'.
+
+    Antigravity identifies models with a display name plus a tier suffix rather
+    than a provider model id, so the OpenRouter table (keyed on ids like
+    'google/gemini-3.1-pro') will not match one. Strip the tier suffix and
+    hyphenate what is left so MANUAL_PRICING can price every tier of a model
+    from a single entry.
+    """
+    base = re.sub(r"\s*\([^)]*\)\s*", " ", model_label).strip().lower()
+    base = base.replace(" ", "-").replace("_", "-")
+    return get_manual_cost(base, input_tokens, output_tokens, cache_read_tokens, 0)
+
+
+def _read_antigravity_cwd(filepath: Path) -> str:
+    """Read a conversation's workspace directory out of its database.
+
+    Antigravity records the workspace in a step_payload submessage, and which
+    submessage depends on the front-end and version: the `agy` CLI writes it to
+    f28.f2, the IDE to f140.f1.f2, and both to f19.f12.f1.f42.f11.f1. Those
+    slots also carry unrelated short strings and per-file paths, so candidates
+    must look like an absolute path, and a directory that still exists on disk
+    is preferred over a file that happens to be mentioned more often.
+
+    Collection reads each database's workspace once to bucket it by project and
+    again while analyzing it, so the result is memoized against the file's
+    size and mtime to keep that second lookup free.
+    """
+    try:
+        file_stat = filepath.stat()
+    except OSError:
+        return ""
+    return _read_antigravity_cwd_cached(str(filepath), file_stat.st_mtime_ns, file_stat.st_size)
+
+
+@lru_cache(maxsize=8192)
+def _read_antigravity_cwd_cached(filepath: str, _mtime_ns: int, _size: int) -> str:
+    """Uncached worker for _read_antigravity_cwd; the extra arguments key the cache."""
+    path = Path(filepath)
+    field_paths = ((28, 2), (140, 1, 2), (19, 12, 1, 42, 11, 1))
+    counts: DefaultDict[str, int] = defaultdict(int)
+
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            payloads = conn.execute(
+                "SELECT step_payload FROM steps WHERE step_payload IS NOT NULL"
+            )
+            for (blob,) in payloads:
+                for field_path in field_paths:
+                    raw = _antigravity_field(blob, field_path[0])
+                    for part in field_path[1:]:
+                        if not raw:
+                            break
+                        raw = _antigravity_field(raw, part)
+                    if not raw:
+                        continue
+                    try:
+                        value = raw.decode("utf-8")
+                    except UnicodeDecodeError:
+                        continue
+                    if value.startswith("/"):
+                        counts[value] += 1
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return ""
+
+    if not counts:
+        return ""
+    best = max(counts, key=lambda p: counts[p])
+    for candidate, _ in sorted(counts.items(), key=lambda kv: -kv[1]):
+        if os.path.isdir(candidate):
+            return candidate
+    return best
+
+
+def analyze_antigravity_db_file(filepath: Path) -> SessionStats:
+    """Analyze one Antigravity conversation database and return stats."""
+    stats = create_session_stats()
+    stats["cwd"] = _read_antigravity_cwd(filepath)
+
+    try:
+        conn = sqlite3.connect(f"file:{filepath}?mode=ro", uri=True)
+        try:
+            rows = conn.execute(
+                "SELECT step_type, status, metadata FROM steps ORDER BY idx"
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        print(f"Error reading Antigravity session {filepath}: {e}")
+        return stats
+
+    for step_type, status, metadata in rows:
+        if not metadata:
+            continue
+
+        start_ts = _antigravity_timestamp(_antigravity_field(metadata, 1))
+        if start_ts:
+            _record_timestamp(stats, start_ts)
+        end_ts = _antigravity_timestamp(_antigravity_field(metadata, 8))
+        step_duration = (
+            (end_ts - start_ts).total_seconds() if (start_ts and end_ts) else 0.0
+        )
+
+        if step_type in ANTIGRAVITY_STEP_LLM:
+            usage_blob = _antigravity_field(metadata, 9)
+            if not usage_blob:
+                continue
+            usage = _antigravity_varints(usage_blob)
+
+            model_id = usage.get(1, 0)
+            model = ANTIGRAVITY_MODEL_ID_MAP.get(model_id, f"Antigravity Model {model_id}")
+
+            input_tok = max(0, usage.get(2, 0))
+            # Field 3 is the full generated count; reasoning (9) is a slice of
+            # it, so bill the whole thing at the output rate and report the
+            # non-reasoning remainder as output plus reasoning separately.
+            output_tok = max(0, usage.get(3, 0))
+            cache_read_tok = max(0, usage.get(5, 0))
+            reasoning_tok = max(0, usage.get(9, 0))
+
+            cost = get_antigravity_cost(model, input_tok, output_tok, cache_read_tok)
+
+            visible_tok = output_tok - reasoning_tok
+            llm_delta = step_duration if 0 < step_duration < 600 else 0.0
+            if llm_delta:
+                stats["llm_time"] += llm_delta
+
+            record_llm_usage(
+                stats,
+                model,
+                input_tok,
+                visible_tok,
+                cache_read_tok,
+                reasoning_tokens=reasoning_tok,
+                # Reasoning is reported as its own slice of the output, so the
+                # headline total counts only the tokens the UI itemises.
+                total_tokens=input_tok + visible_tok + cache_read_tok,
+                cost=cost,
+                ts=start_ts,
+                llm_delta=llm_delta,
+            )
+
+        elif step_type == ANTIGRAVITY_STEP_TOOL:
+            tool_name = _antigravity_string(_antigravity_field(metadata, 4) or b"", 2)
+            if not tool_name:
+                continue
+            tool_delta = step_duration if 0 < step_duration < 600 else 0.0
+            if tool_delta:
+                stats["tool_time"] += tool_delta
+            stats["tools"][tool_name]["calls"] += 1
+            stats["tools"][tool_name]["time"] += tool_delta
+            if status == ANTIGRAVITY_STEP_ERROR:
+                stats["tools"][tool_name]["errors"] += 1
+
+    return stats
+
+
 def analyze_session_file(filepath: Path, source_type: str) -> SessionStats:
     """Dispatch to the correct parser based on source type."""
     if source_type == "claude":
@@ -1548,6 +1840,8 @@ def analyze_session_file(filepath: Path, source_type: str) -> SessionStats:
         return analyze_codex_jsonl_file(filepath)
     elif source_type == "gemini":
         return analyze_gemini_jsonl_file(filepath)
+    elif source_type == "antigravity":
+        return analyze_antigravity_db_file(filepath)
     else:
         return analyze_jsonl_file(filepath)
 
@@ -1730,6 +2024,9 @@ def export_session_to_html(session_path: str, agent_cmd: str) -> str:
         elif agent_name.startswith("gemini"):
             script = Path(__file__).parent / "gemini_export.py"
             cmd = [sys.executable or "python3", str(script), session_path, str(output_file)]
+        elif agent_name.startswith("agy") or agent_name.startswith("antigravity"):
+            script = Path(__file__).parent / "antigravity_export.py"
+            cmd = [sys.executable or "python3", str(script), session_path, str(output_file)]
         else:
             cmd = [*base_cmd, "--export", session_path, str(output_file)]
 
@@ -1793,6 +2090,42 @@ def _build_codex_project_stats(
         )
 
         session_uid = get_session_id_from_file(str(filepath), "codex") or str(
+            uuid.uuid4()
+        )
+
+        session = build_session_record(
+            filepath,
+            session_uid,
+            filepath.name,
+            stats,
+            agent_cmd,
+            duration,
+        )
+        SESSION_REGISTRY[session_uid] = session
+        project_stats["sessions"].append(session)
+        accumulate_session_into_project(project_stats, stats)
+
+    return project_stats if project_stats["sessions"] else None
+
+
+def _build_antigravity_project_stats(
+    project_cwd: str, files: list[Path], agent_cmd: str
+) -> ProjectStats | None:
+    """Build a ProjectStats from Antigravity conversation DBs grouped by cwd."""
+    project_stats = create_project_stats(project_cwd, agent_cmd)
+
+    for filepath in sorted(files):
+        stats = analyze_antigravity_db_file(filepath)
+        if stats["messages"] == 0:
+            continue
+
+        duration = (
+            (stats["end"] - stats["start"]).total_seconds()
+            if stats["start"] and stats["end"]
+            else 0
+        )
+
+        session_uid = get_session_id_from_file(str(filepath), "antigravity") or str(
             uuid.uuid4()
         )
 
@@ -1885,6 +2218,26 @@ def collect_all_stats() -> tuple[list[ProjectStats], GlobalStats]:
                 # Create a temporary directory-like structure for analyze
                 # by building ProjectStats directly
                 project_stats = _build_codex_project_stats(
+                    project_cwd, files, agent_cmd
+                )
+                if project_stats and project_stats["sessions"]:
+                    all_projects.append(project_stats)
+                    _accumulate_global_stats(global_stats, project_stats)
+            continue
+
+        if source_type == "antigravity":
+            # Antigravity: one SQLite database per conversation, all sitting
+            # flat in conversations/. Group them by the workspace each one ran
+            # in to create virtual "projects".
+            agy_projects: dict[str, list[Path]] = defaultdict(list)
+            conversations_dir = sessions_dir / "conversations"
+            if conversations_dir.is_dir():
+                for db_file in conversations_dir.glob("*.db"):
+                    cwd = _read_antigravity_cwd(db_file)
+                    agy_projects[cwd if cwd else "unknown"].append(db_file)
+
+            for project_cwd, files in agy_projects.items():
+                project_stats = _build_antigravity_project_stats(
                     project_cwd, files, agent_cmd
                 )
                 if project_stats and project_stats["sessions"]:
@@ -2296,7 +2649,8 @@ def generate_html():
         </div>
 
         <footer>
-            Agent Cost Dashboard • Data from ~/.pi, ~/.omp, ~/.claude, and ~/.codex
+            Agent Cost Dashboard • Data from ~/.pi, ~/.omp, ~/.claude, ~/.codex,
+            ~/.gemini and ~/.antigravity
         </footer>
     </div>
     <script>
@@ -2391,7 +2745,7 @@ def main():
             socketserver.TCPServer.server_bind(self)
 
     httpd = DashboardServer((args.host, args.port), DashboardHandler)
-    print("🚀 Agent Cost Dashboard (pi, omp, claude, codex, gemini)")
+    print("🚀 Agent Cost Dashboard (pi, omp, claude, codex, gemini, antigravity)")
     print(f"   Serving on: http://{args.host}:{args.port}")
     print("   Data from:")
     for sessions_dir, agent_cmd, source_type in SESSIONS_DIRS:

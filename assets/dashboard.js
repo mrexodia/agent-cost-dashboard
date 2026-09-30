@@ -176,6 +176,8 @@ function buildResumeCmd(agentCmd, cwd, sessionPath, sessionUid) {
         return 'cd "' + cwd + '" && claude --resume "' + sessionUid + '"';
     } else if (agentCmd === 'codex') {
         return 'cd "' + cwd + '" && codex --resume "' + sessionUid + '"';
+    } else if (agentCmd === 'agy') {
+        return 'cd "' + cwd + '" && agy --conversation "' + sessionUid + '"';
     } else {
         return 'cd "' + cwd + '" && ' + agentCmd + ' --session "' + sessionPath + '"';
     }
