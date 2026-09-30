@@ -176,7 +176,12 @@ SESSIONS_DIRS = [
     (Path.home() / ".gemini" / "antigravity-cli", "agy", "antigravity"),
     (Path.home() / ".gemini" / "antigravity", "agy", "antigravity"),
     (Path.home() / ".antigravity", "agy", "antigravity"),
+    (Path.home() / ".local" / "share" / "opencode", "opencode", "opencode"),
 ]
+# Sessions that are identified by an id resolved through the agent's own
+# tooling rather than by a file on disk. OpenCode keeps every session in one
+# database, so there is no per-session path to check before exporting.
+SESSION_ID_ONLY_AGENTS = {"opencode"}
 TEMP_DIR = Path(tempfile.gettempdir()) / "pi-dashboard"
 ASSETS_DIR = Path(__file__).parent / "assets"
 
@@ -1832,6 +1837,223 @@ def analyze_antigravity_db_file(filepath: Path) -> SessionStats:
     return stats
 
 
+# OpenCode keeps every session from every project in a single SQLite database
+# (~/.local/share/opencode/opencode.db) rather than one file per project, so it
+# needs its own loader. The rows carry a JSON payload in `data`:
+#   message.data  role, modelID/providerID, tokens (input/output/reasoning and
+#                 cache.read/cache.write), and time.created/time.completed
+#   part.data     tool calls, with the tool name and state.time start/end
+# All timestamps are epoch milliseconds.
+#
+# As with Antigravity, the token buckets are disjoint and additive: the reported
+# total is input + output + cache.read + cache.write + reasoning, so cache reads
+# and reasoning must not be subtracted from input or output the way the Codex
+# analyzer has to. OpenCode also reports a cost of zero for everything — most of
+# it runs local or free-tier models, and the paid models it does call are not in
+# the pricing table — so costs here are derived from the token counts.
+OPENCODE_DB_FILENAME = "opencode.db"
+
+
+def opencode_timestamp(value) -> datetime | None:
+    """Convert an OpenCode epoch-millisecond timestamp to a UTC datetime."""
+    if not value:
+        return None
+    try:
+        return datetime.fromtimestamp(int(value) / 1000, tz=timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def _opencode_tool_name(part: dict) -> str:
+    """The tool a part belongs to, for the dashboard's tool table.
+
+    When a model emits input OpenCode cannot parse it records the part under a
+    synthetic "invalid" tool, keeping the real tool name alongside the parse
+    error. Counting those under a tool literally called "invalid" would hide
+    them from the tool they actually failed on, so prefer the real name.
+    """
+    name = part.get("tool")
+    if name and name != "invalid":
+        return name
+    original = ((part.get("state") or {}).get("input") or {}).get("tool")
+    return original or name or "unknown"
+
+
+def analyze_opencode_session(
+    directory: str, messages: list[dict], tool_parts: list[dict]
+) -> SessionStats:
+    """Build SessionStats for one OpenCode session from its rows.
+
+    `messages` are the assistant message payloads and `tool_parts` the tool
+    part payloads belonging to that session.
+    """
+    stats = create_session_stats()
+    stats["cwd"] = directory or ""
+
+    for message in messages:
+        tokens = message.get("tokens") or {}
+        cache = tokens.get("cache") or {}
+
+        input_tok = int(tokens.get("input") or 0)
+        output_tok = int(tokens.get("output") or 0)
+        reasoning_tok = int(tokens.get("reasoning") or 0)
+        cache_read_tok = int(cache.get("read") or 0)
+        cache_write_tok = int(cache.get("write") or 0)
+        # Sum the components rather than trusting tokens.total: on aborted
+        # streams the total can disagree with the counters it is derived from.
+        # Reasoning is left out so the itemised rows add up to the total, the
+        # same convention the other analyzers use.
+        total_tok = input_tok + output_tok + cache_read_tok + cache_write_tok
+
+        model = (
+            message.get("modelID")
+            or (message.get("model") or {}).get("id")
+            or "unknown"
+        )
+
+        times = message.get("time") or {}
+        created = opencode_timestamp(times.get("created"))
+        completed = opencode_timestamp(times.get("completed"))
+        llm_delta = (
+            (completed - created).total_seconds() if (created and completed) else 0.0
+        )
+        if 0 < llm_delta < 600:
+            stats["llm_time"] += llm_delta
+
+        cost = get_manual_cost(
+            model,
+            input_tok,
+            output_tok + reasoning_tok,
+            cache_read_tok,
+            cache_write_tok,
+        )
+
+        record_llm_usage(
+            stats,
+            model,
+            input_tok,
+            output_tok,
+            cache_read_tok,
+            cache_write_tok,
+            reasoning_tokens=reasoning_tok,
+            total_tokens=total_tok,
+            cost=cost,
+            ts=completed or created,
+            llm_delta=llm_delta,
+        )
+
+    for part in tool_parts:
+        state = part.get("state") or {}
+        tool_name = _opencode_tool_name(part)
+
+        tool_delta = 0.0
+        times = state.get("time") or {}
+        start = opencode_timestamp(times.get("start"))
+        end = opencode_timestamp(times.get("end"))
+        if start and end:
+            tool_delta = (end - start).total_seconds()
+
+        stats["tools"][tool_name]["calls"] += 1
+        if 0 < tool_delta < 600:
+            stats["tool_time"] += tool_delta
+            stats["tools"][tool_name]["time"] += tool_delta
+        if state.get("status") == "error":
+            stats["tools"][tool_name]["errors"] += 1
+        # Keep the session window anchored even for sessions whose only tool
+        # activity came after the last completed model call.
+        if start:
+            _record_timestamp(stats, start)
+        if end:
+            _record_timestamp(stats, end)
+
+    return stats
+
+
+def analyze_opencode_db(db_path: Path, agent_cmd: str) -> list[ProjectStats]:
+    """Read every OpenCode session from one database, grouped by directory."""
+    projects: dict[str, ProjectStats] = {}
+
+    def project_for(directory: str) -> ProjectStats:
+        key = directory or "unknown"
+        if key not in projects:
+            projects[key] = create_project_stats(key, agent_cmd)
+        return projects[key]
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            sessions = conn.execute(
+                "SELECT id, directory, time_created, time_updated FROM session"
+            ).fetchall()
+            # Pull every message and tool part in two passes rather than
+            # querying per session: the table is large and json_extract() over
+            # every part row costs far more than filtering in Python. The
+            # owning session comes from the session_id column, not the payload.
+            messages_by_session: DefaultDict[str, list[dict]] = defaultdict(list)
+            for session_id, data in conn.execute("SELECT session_id, data FROM message"):
+                message = _load_json_object(data)
+                if message and message.get("role") == "assistant":
+                    messages_by_session[session_id].append(message)
+
+            tools_by_session: DefaultDict[str, list[dict]] = defaultdict(list)
+            for session_id, data in conn.execute("SELECT session_id, data FROM part"):
+                part = _load_json_object(data)
+                if part and part.get("type") == "tool":
+                    tools_by_session[session_id].append(part)
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        print(f"Error reading OpenCode database {db_path}: {e}")
+        return []
+
+    for session_id, directory, created_ms, updated_ms in sessions:
+        stats = analyze_opencode_session(
+            directory,
+            messages_by_session.get(session_id) or [],
+            tools_by_session.get(session_id) or [],
+        )
+        if stats["messages"] == 0:
+            continue
+
+        # Fall back to the session row for a window when no row carried one.
+        if stats["start"] is None:
+            stats["start"] = opencode_timestamp(created_ms)
+        if stats["end"] is None:
+            stats["end"] = opencode_timestamp(updated_ms)
+
+        duration = (
+            (stats["end"] - stats["start"]).total_seconds()
+            if stats["start"] and stats["end"]
+            else 0
+        )
+
+        session = build_session_record(
+            Path(session_id),
+            session_id,
+            session_id,
+            stats,
+            agent_cmd,
+            duration,
+        )
+        SESSION_REGISTRY[session_id] = session
+        project = project_for(directory)
+        project["sessions"].append(session)
+        accumulate_session_into_project(project, stats)
+
+    return [project for project in projects.values() if project["sessions"]]
+
+
+def _load_json_object(data) -> dict | None:
+    """Parse a JSON payload column, returning None when it is unusable."""
+    if not data:
+        return None
+    try:
+        parsed = json.loads(data)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def analyze_session_file(filepath: Path, source_type: str) -> SessionStats:
     """Dispatch to the correct parser based on source type."""
     if source_type == "claude":
@@ -2026,6 +2248,9 @@ def export_session_to_html(session_path: str, agent_cmd: str) -> str:
             cmd = [sys.executable or "python3", str(script), session_path, str(output_file)]
         elif agent_name.startswith("agy") or agent_name.startswith("antigravity"):
             script = Path(__file__).parent / "antigravity_export.py"
+            cmd = [sys.executable or "python3", str(script), session_path, str(output_file)]
+        elif agent_name.startswith("opencode"):
+            script = Path(__file__).parent / "opencode_export.py"
             cmd = [sys.executable or "python3", str(script), session_path, str(output_file)]
         else:
             cmd = [*base_cmd, "--export", session_path, str(output_file)]
@@ -2243,6 +2468,17 @@ def collect_all_stats() -> tuple[list[ProjectStats], GlobalStats]:
                 if project_stats and project_stats["sessions"]:
                     all_projects.append(project_stats)
                     _accumulate_global_stats(global_stats, project_stats)
+            continue
+
+        if source_type == "opencode":
+            # OpenCode: every session from every project shares one database,
+            # already carrying the directory each session ran in.
+            db_file = sessions_dir / OPENCODE_DB_FILENAME
+            if not db_file.exists():
+                continue
+            for project_stats in analyze_opencode_db(db_file, agent_cmd):
+                all_projects.append(project_stats)
+                _accumulate_global_stats(global_stats, project_stats)
             continue
 
         # Standard, Claude, Gemini: iterate per-project subdirectories
@@ -2650,7 +2886,7 @@ def generate_html():
 
         <footer>
             Agent Cost Dashboard • Data from ~/.pi, ~/.omp, ~/.claude, ~/.codex,
-            ~/.gemini and ~/.antigravity
+            ~/.gemini, ~/.antigravity and ~/.local/share/opencode
         </footer>
     </div>
     <script>
@@ -2687,7 +2923,9 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             if session_info:
                 session_path = session_info["path"]
                 agent_cmd = session_info["agent_cmd"]
-                if Path(session_path).exists():
+                if Path(session_path).exists() or (
+                    agent_cmd in SESSION_ID_ONLY_AGENTS
+                ):
                     self.send_response(200)
                     self.send_header("Content-type", "text/html; charset=utf-8")
                     self.end_headers()
