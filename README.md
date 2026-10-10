@@ -123,6 +123,8 @@ python opencode_export.py ses_abc123 output.html
 
 Costs are calculated using pricing reported by the agent. For models that don't report costs (e.g., Gemini via Google Cloud, and OpenCode which always records zero), estimated pricing is applied based on public API rates. OpenCode runs a lot of local and free-tier models (LM Studio, Ollama, Lemonade, and the `*-free` Zen tiers), which correctly show no cost because there is none; refresh `models.json` with `python3 update_models.py` when a newly used model should be priced. Supported model families: Claude, Gemini (including the Antigravity 3.1–3.8 Flash/Pro tiers), GPT-OSS, GPT-5, O3/O4, GLM.
 
+Negative OpenRouter rates (such as `-1` for `openrouter/auto`) mean pricing is unavailable, not a negative charge. These entries are excluded from price estimation; known built-in rates are used when available. If neither a reported charge nor a known rate exists, the call contributes zero to the displayed cost. This does **not** mean it was free: the total omits those unpriced calls and is not a complete bill.
+
 ## Credits
 
 - **[Mario Zechner](https://github.com/mariozechner)** - For Pi and its session export feature

@@ -3,6 +3,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import cost_dashboard
 import opencode_export
@@ -32,6 +33,73 @@ def field_text(num: int, value: str) -> bytes:
 
 def timestamp(seconds: int) -> bytes:
     return field_varint(1, seconds) + field_varint(2, 0)
+
+
+class OpenRouterPricingTests(unittest.TestCase):
+    def test_negative_rates_are_unknown_not_billable(self):
+        for field in ("prompt", "completion", "input_cache_read", "input_cache_write"):
+            with self.subTest(field=field):
+                pricing = {"prompt": "0.000002", "completion": "0.000008"}
+                pricing[field] = "-1"
+                with (
+                    patch.object(
+                        cost_dashboard,
+                        "_load_openrouter_models",
+                        return_value={
+                            "data": [{"id": "openrouter/auto", "pricing": pricing}]
+                        },
+                    ),
+                    patch.object(cost_dashboard, "_OPENROUTER_PRICING", None),
+                ):
+                    self.assertIsNone(
+                        cost_dashboard.get_openrouter_cost("auto", 1000, 100, 500, 50)
+                    )
+                    self.assertEqual(
+                        cost_dashboard.get_manual_cost("auto", 1000, 100, 500, 50),
+                        0.0,
+                    )
+
+    def test_unknown_rate_uses_known_manual_pricing(self):
+        with (
+            patch.object(
+                cost_dashboard,
+                "_load_openrouter_models",
+                return_value={
+                    "data": [
+                        {
+                            "id": "z-ai/glm-4.7",
+                            "pricing": {"prompt": "-1", "completion": "-1"},
+                        }
+                    ]
+                },
+            ),
+            patch.object(cost_dashboard, "_OPENROUTER_PRICING", None),
+        ):
+            self.assertAlmostEqual(
+                cost_dashboard.get_manual_cost("glm-4.7", 1_000_000, 1_000_000, 0),
+                2.12,
+            )
+
+    def test_zero_rates_remain_valid_free_pricing(self):
+        with (
+            patch.object(
+                cost_dashboard,
+                "_load_openrouter_models",
+                return_value={
+                    "data": [
+                        {
+                            "id": "z-ai/glm-4.7",
+                            "pricing": {"prompt": "0", "completion": "0"},
+                        }
+                    ]
+                },
+            ),
+            patch.object(cost_dashboard, "_OPENROUTER_PRICING", None),
+        ):
+            self.assertEqual(
+                cost_dashboard.get_manual_cost("glm-4.7", 1_000_000, 1_000_000, 0),
+                0.0,
+            )
 
 
 class StandardSessionMetadataTests(unittest.TestCase):
@@ -154,7 +222,9 @@ class AntigravitySessionTests(unittest.TestCase):
         conn.commit()
         conn.close()
 
-    def usage_step(self, model_id, input_tok, output_tok, cached, reasoning, start, end):
+    def usage_step(
+        self, model_id, input_tok, output_tok, cached, reasoning, start, end
+    ):
         usage = (
             field_varint(1, model_id)
             + field_varint(2, input_tok)
@@ -213,9 +283,7 @@ class AntigravitySessionTests(unittest.TestCase):
 
             stats = cost_dashboard.analyze_antigravity_db_file(path)
 
-            expected = (
-                1000 * 0.50 + 300 * 3.00 + 16000 * 0.05
-            ) / 1_000_000
+            expected = (1000 * 0.50 + 300 * 3.00 + 16000 * 0.05) / 1_000_000
             self.assertAlmostEqual(stats["cost_total"], expected, places=9)
             self.assertIn("Gemini 3.8 Flash", stats["models"])
 
@@ -490,7 +558,9 @@ class OpenCodeSessionTests(unittest.TestCase):
                 ],
             )
 
-            stats = cost_dashboard.analyze_opencode_db(path, "opencode")[0]["sessions"][0]
+            stats = cost_dashboard.analyze_opencode_db(path, "opencode")[0]["sessions"][
+                0
+            ]
             self.assertEqual(stats["tools"]["bash"]["calls"], 2)
             self.assertEqual(stats["tools"]["bash"]["errors"], 1)
             self.assertEqual(stats["tools"]["read"]["calls"], 1)
@@ -529,7 +599,9 @@ class OpenCodeSessionTests(unittest.TestCase):
                 [bad],
             )
 
-            stats = cost_dashboard.analyze_opencode_db(path, "opencode")[0]["sessions"][0]
+            stats = cost_dashboard.analyze_opencode_db(path, "opencode")[0]["sessions"][
+                0
+            ]
             self.assertEqual(stats["tools"]["bash"]["calls"], 1)
             self.assertNotIn("invalid", stats["tools"])
 
@@ -592,9 +664,9 @@ class OpenCodeSessionTests(unittest.TestCase):
             path, _ = self.build_single_session_db(
                 temp_dir, self.tokens(1, 1, 0, 0), []
             )
-            stats = cost_dashboard.analyze_opencode_db(path, "opencode")[0][
-                "sessions"
-            ][0]
+            stats = cost_dashboard.analyze_opencode_db(path, "opencode")[0]["sessions"][
+                0
+            ]
             # Costs are attributed to the moment the call completed, which the
             # fixture sets two seconds after the window opened.
             self.assertEqual(stats["start"].isoformat(), "2023-11-14T22:13:22+00:00")

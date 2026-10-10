@@ -168,7 +168,11 @@ def create_daily_stats() -> DailyStats:
 # source_type: "standard" (pi/omp), "claude" (~/.claude/projects), "codex" (~/.codex/sessions), "antigravity"
 SESSIONS_DIRS = [
     (Path.home() / ".pi" / "agent" / "sessions", "pi", "standard"),
-    (Path.home() / "agentbox" / "config" / ".pi" / "agent" / "sessions", "pi", "standard"),
+    (
+        Path.home() / "agentbox" / "config" / ".pi" / "agent" / "sessions",
+        "pi",
+        "standard",
+    ),
     (Path.home() / ".omp" / "agent" / "sessions", "omp", "standard"),
     (Path.home() / ".claude" / "projects", "claude", "claude"),
     (Path.home() / ".codex" / "sessions", "codex", "codex"),
@@ -556,6 +560,10 @@ def _build_openrouter_pricing() -> dict[str, dict[str, float]]:
             "cache_read": per_million("input_cache_read"),
             "cache_write": per_million("input_cache_write"),
         }
+        # Routers such as openrouter/auto use -1 for unknown pricing, not
+        # a negative charge. Leave them unpriced so manual fallback can apply.
+        if any(rate < 0 for rate in entry.values()):
+            continue
         key = _normalize_model_name(model_id)
         # Don't let a $0 variant clobber an already-priced entry.
         if key in pricing and entry["input"] == 0 and entry["output"] == 0:
@@ -613,9 +621,7 @@ def get_manual_cost(
         pricing = MANUAL_PRICING[best_pattern]
         input_cost = (input_tokens / 1_000_000) * pricing["input"]
         output_cost = (output_tokens / 1_000_000) * pricing["output"]
-        cache_read_cost = (cache_read_tokens / 1_000_000) * pricing.get(
-            "cache_read", 0
-        )
+        cache_read_cost = (cache_read_tokens / 1_000_000) * pricing.get("cache_read", 0)
         cache_write_cost = (cache_write_tokens / 1_000_000) * pricing.get(
             "cache_write", 0
         )
@@ -1178,9 +1184,7 @@ def analyze_claude_jsonl_file(filepath: Path) -> SessionStats:
                                         stats["tool_time"] += tool_delta
                                         tool_name = call_info["name"]
                                         stats["tools"][tool_name]["calls"] += 1
-                                        stats["tools"][tool_name][
-                                            "time"
-                                        ] += tool_delta
+                                        stats["tools"][tool_name]["time"] += tool_delta
                                         if is_error:
                                             stats["tools"][tool_name]["errors"] += 1
 
@@ -1208,10 +1212,10 @@ def analyze_claude_jsonl_file(filepath: Path) -> SessionStats:
                         input_tok = usage.get("input_tokens", 0)
                         output_tok = usage.get("output_tokens", 0)
                         cache_read_tok = usage.get("cache_read_input_tokens", 0)
-                        cache_write_tok = usage.get(
-                            "cache_creation_input_tokens", 0
+                        cache_write_tok = usage.get("cache_creation_input_tokens", 0)
+                        total_tok = (
+                            input_tok + output_tok + cache_read_tok + cache_write_tok
                         )
-                        total_tok = input_tok + output_tok + cache_read_tok + cache_write_tok
 
                         cost = get_manual_cost(
                             model,
@@ -1304,9 +1308,7 @@ def analyze_codex_jsonl_file(filepath: Path) -> SessionStats:
 
     def subtract_usage(current: dict, previous: dict) -> dict:
         return {
-            "input_tokens": max(
-                0, current["input_tokens"] - previous["input_tokens"]
-            ),
+            "input_tokens": max(0, current["input_tokens"] - previous["input_tokens"]),
             "output_tokens": max(
                 0, current["output_tokens"] - previous["output_tokens"]
             ),
@@ -1317,19 +1319,15 @@ def analyze_codex_jsonl_file(filepath: Path) -> SessionStats:
                 0,
                 current["cache_read_tokens"] - previous["cache_read_tokens"],
             ),
-            "total_tokens": max(
-                0, current["total_tokens"] - previous["total_tokens"]
-            ),
+            "total_tokens": max(0, current["total_tokens"] - previous["total_tokens"]),
         }
 
     def add_usage(left: dict, right: dict) -> dict:
         return {
             "input_tokens": left["input_tokens"] + right["input_tokens"],
             "output_tokens": left["output_tokens"] + right["output_tokens"],
-            "reasoning_tokens": left["reasoning_tokens"]
-            + right["reasoning_tokens"],
-            "cache_read_tokens": left["cache_read_tokens"]
-            + right["cache_read_tokens"],
+            "reasoning_tokens": left["reasoning_tokens"] + right["reasoning_tokens"],
+            "cache_read_tokens": left["cache_read_tokens"] + right["cache_read_tokens"],
             "total_tokens": left["total_tokens"] + right["total_tokens"],
         }
 
@@ -1436,9 +1434,7 @@ def analyze_codex_jsonl_file(filepath: Path) -> SessionStats:
                     reasoning_tok = delta_usage["reasoning_tokens"]
                     total_tok = delta_usage["total_tokens"]
 
-                    cost = get_manual_cost(
-                        model, input_tok, output_tok, cache_read_tok
-                    )
+                    cost = get_manual_cost(model, input_tok, output_tok, cache_read_tok)
 
                     record_llm_usage(
                         stats,
@@ -1477,9 +1473,7 @@ def analyze_codex_jsonl_file(filepath: Path) -> SessionStats:
                         call_id = payload.get("call_id")
                         if ts and call_id and call_id in pending_tool_calls:
                             call_info = pending_tool_calls.pop(call_id)
-                            tool_delta = (
-                                ts - call_info["timestamp"]
-                            ).total_seconds()
+                            tool_delta = (ts - call_info["timestamp"]).total_seconds()
                             if 0 < tool_delta < 600:
                                 stats["tool_time"] += tool_delta
                                 tool_name = call_info["name"]
@@ -1534,11 +1528,11 @@ def analyze_gemini_jsonl_file(filepath: Path) -> SessionStats:
                 if record_type == "user":
                     if ts:
                         last_request_ts = ts
-                
+
                 elif record_type == "gemini":
                     model = data.get("model", "unknown")
                     tokens = data.get("tokens", {})
-                    
+
                     # Calculate LLM time
                     llm_delta = 0
                     if ts and last_request_ts:
@@ -1552,7 +1546,9 @@ def analyze_gemini_jsonl_file(filepath: Path) -> SessionStats:
                     raw_input_tok = tokens.get("input", 0)
                     output_tok = tokens.get("output", 0)
                     cache_read_tok = tokens.get("cached", 0)
-                    cache_write_tok = tokens.get("cacheWrite", 0)  # Check for explicit write tokens
+                    cache_write_tok = tokens.get(
+                        "cacheWrite", 0
+                    )  # Check for explicit write tokens
 
                     # Gemini's reported "input" token count is inclusive of any
                     # cached tokens served from context cache, so bill/store
@@ -1561,7 +1557,8 @@ def analyze_gemini_jsonl_file(filepath: Path) -> SessionStats:
                     # same fix applied to the Codex analyzer above).
                     input_tok = max(0, raw_input_tok - cache_read_tok)
                     total_tok = tokens.get(
-                        "total", input_tok + output_tok + cache_read_tok + cache_write_tok
+                        "total",
+                        input_tok + output_tok + cache_read_tok + cache_write_tok,
                     )
 
                     cost = get_manual_cost(
@@ -1709,7 +1706,9 @@ def _read_antigravity_cwd(filepath: Path) -> str:
         file_stat = filepath.stat()
     except OSError:
         return ""
-    return _read_antigravity_cwd_cached(str(filepath), file_stat.st_mtime_ns, file_stat.st_size)
+    return _read_antigravity_cwd_cached(
+        str(filepath), file_stat.st_mtime_ns, file_stat.st_size
+    )
 
 
 @lru_cache(maxsize=8192)
@@ -1790,7 +1789,9 @@ def analyze_antigravity_db_file(filepath: Path) -> SessionStats:
             usage = _antigravity_varints(usage_blob)
 
             model_id = usage.get(1, 0)
-            model = ANTIGRAVITY_MODEL_ID_MAP.get(model_id, f"Antigravity Model {model_id}")
+            model = ANTIGRAVITY_MODEL_ID_MAP.get(
+                model_id, f"Antigravity Model {model_id}"
+            )
 
             input_tok = max(0, usage.get(2, 0))
             # Field 3 is the full generated count; reasoning (9) is a slice of
@@ -1990,7 +1991,9 @@ def analyze_opencode_db(db_path: Path, agent_cmd: str) -> list[ProjectStats]:
             # every part row costs far more than filtering in Python. The
             # owning session comes from the session_id column, not the payload.
             messages_by_session: DefaultDict[str, list[dict]] = defaultdict(list)
-            for session_id, data in conn.execute("SELECT session_id, data FROM message"):
+            for session_id, data in conn.execute(
+                "SELECT session_id, data FROM message"
+            ):
                 message = _load_json_object(data)
                 if message and message.get("role") == "assistant":
                     messages_by_session[session_id].append(message)
@@ -2239,19 +2242,44 @@ def export_session_to_html(session_path: str, agent_cmd: str) -> str:
 
         if agent_name.startswith("claude"):
             script = Path(__file__).parent / "claude_export.py"
-            cmd = [sys.executable or "python3", str(script), session_path, str(output_file)]
+            cmd = [
+                sys.executable or "python3",
+                str(script),
+                session_path,
+                str(output_file),
+            ]
         elif agent_name.startswith("codex"):
             script = Path(__file__).parent / "codex_export.py"
-            cmd = [sys.executable or "python3", str(script), session_path, str(output_file)]
+            cmd = [
+                sys.executable or "python3",
+                str(script),
+                session_path,
+                str(output_file),
+            ]
         elif agent_name.startswith("gemini"):
             script = Path(__file__).parent / "gemini_export.py"
-            cmd = [sys.executable or "python3", str(script), session_path, str(output_file)]
+            cmd = [
+                sys.executable or "python3",
+                str(script),
+                session_path,
+                str(output_file),
+            ]
         elif agent_name.startswith("agy") or agent_name.startswith("antigravity"):
             script = Path(__file__).parent / "antigravity_export.py"
-            cmd = [sys.executable or "python3", str(script), session_path, str(output_file)]
+            cmd = [
+                sys.executable or "python3",
+                str(script),
+                session_path,
+                str(output_file),
+            ]
         elif agent_name.startswith("opencode"):
             script = Path(__file__).parent / "opencode_export.py"
-            cmd = [sys.executable or "python3", str(script), session_path, str(output_file)]
+            cmd = [
+                sys.executable or "python3",
+                str(script),
+                session_path,
+                str(output_file),
+            ]
         else:
             cmd = [*base_cmd, "--export", session_path, str(output_file)]
 
@@ -2378,7 +2406,9 @@ def _accumulate_global_stats(
     global_stats["total_input_tokens"] += project_stats["total_input_tokens"]
     global_stats["total_output_tokens"] += project_stats["total_output_tokens"]
     global_stats["total_cache_read_tokens"] += project_stats["total_cache_read_tokens"]
-    global_stats["total_cache_write_tokens"] += project_stats["total_cache_write_tokens"]
+    global_stats["total_cache_write_tokens"] += project_stats[
+        "total_cache_write_tokens"
+    ]
     global_stats["total_reasoning_tokens"] += project_stats["total_reasoning_tokens"]
     global_stats["total_messages"] += project_stats["total_messages"]
     global_stats["total_sessions"] += len(project_stats["sessions"])
@@ -2394,11 +2424,9 @@ def _accumulate_global_stats(
         global_stats["daily_stats"][day]["messages"] += dstats["messages"]
         global_stats["daily_stats"][day]["cost"] += dstats["cost"]
         for mdl, mcost in dstats.get("models", {}).items():
-            global_stats["daily_stats"][day]["models"][
-                mdl
-            ] = global_stats["daily_stats"][day]["models"].get(
-                mdl, 0.0
-            ) + mcost
+            global_stats["daily_stats"][day]["models"][mdl] = (
+                global_stats["daily_stats"][day]["models"].get(mdl, 0.0) + mcost
+            )
 
 
 def collect_all_stats() -> tuple[list[ProjectStats], GlobalStats]:
@@ -2700,7 +2728,9 @@ def generate_html():
         )
 
     # Build global tools JSON for client-side sorting
-    total_tool_time_val = global_stats["total_tool_time"] if global_stats["total_tool_time"] > 0 else 1
+    total_tool_time_val = (
+        global_stats["total_tool_time"] if global_stats["total_tool_time"] > 0 else 1
+    )
     tools_json = []
     for tool_name, tstats in global_stats["tools"].items():
         tools_json.append(
@@ -2713,9 +2743,7 @@ def generate_html():
                 "avg_time": tstats["time"] / tstats["calls"]
                 if tstats["calls"] > 0
                 else 0,
-                "avg_time_display": format_duration(
-                    tstats["time"] / tstats["calls"]
-                )
+                "avg_time_display": format_duration(tstats["time"] / tstats["calls"])
                 if tstats["calls"] > 0
                 else "0s",
                 "pct": tstats["time"] / total_tool_time_val * 100,
@@ -2923,9 +2951,7 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             if session_info:
                 session_path = session_info["path"]
                 agent_cmd = session_info["agent_cmd"]
-                if Path(session_path).exists() or (
-                    agent_cmd in SESSION_ID_ONLY_AGENTS
-                ):
+                if Path(session_path).exists() or (agent_cmd in SESSION_ID_ONLY_AGENTS):
                     self.send_response(200)
                     self.send_header("Content-type", "text/html; charset=utf-8")
                     self.end_headers()
